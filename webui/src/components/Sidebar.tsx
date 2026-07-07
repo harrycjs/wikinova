@@ -1,9 +1,13 @@
 import { useState, type ReactNode } from "react";
 import {
   Archive,
+  BookOpen,
   Brain,
   CalendarClock,
+  Cpu,
   Menu,
+  Puzzle,
+  Radio,
   Search,
   Settings,
   SquarePen,
@@ -39,7 +43,11 @@ interface SidebarProps {
   onOpenSkills: () => void;
   onOpenAutomations: () => void;
   onOpenSearch: () => void;
-  activeUtility?: "apps" | "skills" | "automations" | null;
+  onOpenChannels: () => void;
+  onOpenModels: () => void;
+  onOpenWiki: () => void;
+  onOpenPlugins: () => void;
+  activeUtility?: "apps" | "skills" | "automations" | "channels" | "models" | "wiki" | "plugins" | null;
   onToggleArchived: () => void;
   onCollapse: () => void;
   onExpand?: () => void;
@@ -163,10 +171,38 @@ export function Sidebar(props: SidebarProps) {
         />
         <SidebarActionButton
           collapsed={collapsed}
+          label={t("sidebar.channels", { defaultValue: "Channels" })}
+          onClick={props.onOpenChannels}
+          active={props.activeUtility === "channels"}
+          icon={<Radio className="h-4 w-4" />}
+        />
+        <SidebarActionButton
+          collapsed={collapsed}
+          label={t("sidebar.models", { defaultValue: "Models" })}
+          onClick={props.onOpenModels}
+          active={props.activeUtility === "models"}
+          icon={<Cpu className="h-4 w-4" />}
+        />
+        <SidebarActionButton
+          collapsed={collapsed}
+          label={t("sidebar.wiki", { defaultValue: "Wiki" })}
+          onClick={props.onOpenWiki}
+          active={props.activeUtility === "wiki"}
+          icon={<BookOpen className="h-4 w-4" />}
+        />
+        <SidebarActionButton
+          collapsed={collapsed}
           label={t("sidebar.skills.title")}
           onClick={props.onOpenSkills}
           active={props.activeUtility === "skills"}
           icon={<Brain className="h-4 w-4" />}
+        />
+        <SidebarActionButton
+          collapsed={collapsed}
+          label={t("sidebar.plugins", { defaultValue: "Plugins" })}
+          onClick={props.onOpenPlugins}
+          active={props.activeUtility === "plugins"}
+          icon={<Puzzle className="h-4 w-4" />}
         />
         <SidebarActionButton
           collapsed={collapsed}

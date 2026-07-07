@@ -187,6 +187,11 @@ class Session:
         for message in sliced:
             if message.get("_command"):
                 continue
+            if message.get("_qa_gate"):
+                # QA-gate refusals are visible to the user but should not
+                # enter the LLM context — they're canned refusals, not real
+                # assistant turns, and would confuse the model on follow-ups.
+                continue
             content = message.get("content", "")
             role = message.get("role")
             if role == "assistant" and isinstance(content, str):

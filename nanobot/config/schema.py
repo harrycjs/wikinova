@@ -162,6 +162,16 @@ class AgentDefaults(Base):
         serialization_alias="consolidationRatio",
     )  # Consolidation target ratio (0.5 = 50% of budget retained after compression)
     dream: DreamConfig = Field(default_factory=DreamConfig)
+    qa_mode: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("qaMode", "qa_mode"),
+        serialization_alias="qaMode",
+    )  # When True, agent is restricted to knowledge-base Q&A: rejects off-topic requests at the pre-LLM gate and uses the QA identity template.
+    qa_gate_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("qaGateEnabled", "qa_gate_enabled"),
+        serialization_alias="qaGateEnabled",
+    )  # When False, skip the pre-LLM intent classifier (only useful for power users; default keeps the gate on whenever qa_mode=True).
 
 
 class AgentsConfig(Base):
@@ -368,6 +378,9 @@ class ToolsConfig(Base):
     image_generation: ImageGenerationToolConfig = Field(
         default_factory=lambda: _lazy_default("nanobot.agent.tools.image_generation", "ImageGenerationToolConfig"),
     )
+    wiki: WikiConfig = Field(default_factory=lambda: _lazy_default("nanobot.config.wiki_schema", "WikiConfig"))
+    ima: IMAToolsConfig = Field(default_factory=lambda: _lazy_default("nanobot.config.wiki_schema", "IMAToolsConfig"))
+    obsidian: ObsidianToolsConfig = Field(default_factory=lambda: _lazy_default("nanobot.config.wiki_schema", "ObsidianToolsConfig"))
     restrict_to_workspace: bool = False  # policy intent: keep tool access inside workspace when possible
     webui_allow_local_service_access: bool = Field(
         default=True,
@@ -614,6 +627,12 @@ def _resolve_tool_config_refs() -> None:
     from nanobot.agent.tools.self import MyToolConfig
     from nanobot.agent.tools.shell import ExecToolConfig
     from nanobot.agent.tools.web import WebFetchConfig, WebSearchConfig, WebToolsConfig
+    from nanobot.config.wiki_schema import (
+        IMAToolsConfig,
+        ObsidianToolsConfig,
+        WikiConfig,
+        WikiEvolutionConfig,
+    )
 
     # Re-export into this module's namespace
     mod = sys.modules[__name__]
@@ -625,6 +644,10 @@ def _resolve_tool_config_refs() -> None:
     mod.WebFetchConfig = WebFetchConfig  # type: ignore[attr-defined]
     mod.MyToolConfig = MyToolConfig  # type: ignore[attr-defined]
     mod.ImageGenerationToolConfig = ImageGenerationToolConfig  # type: ignore[attr-defined]
+    mod.WikiConfig = WikiConfig  # type: ignore[attr-defined]
+    mod.WikiEvolutionConfig = WikiEvolutionConfig  # type: ignore[attr-defined]
+    mod.IMAToolsConfig = IMAToolsConfig  # type: ignore[attr-defined]
+    mod.ObsidianToolsConfig = ObsidianToolsConfig  # type: ignore[attr-defined]
 
     ToolsConfig.model_rebuild()
     Config.model_rebuild()

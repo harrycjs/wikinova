@@ -113,6 +113,50 @@
   }
 }
 
+/* Jobs-style design tokens — opt-in via html.jobs-mode */
+:root {
+  --jobs-radius-card: 4px;
+  --jobs-radius-button: 4px;
+  --jobs-radius-input: 3px;
+  --jobs-motion-fade: 200ms;
+  --jobs-shadow-soft: 0 1px 0 rgba(0, 0, 0, 0.04);
+  --jobs-shadow-pop: 0 12px 32px -16px rgba(0, 0, 0, 0.18);
+  --jobs-font-sans:
+    -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue",
+    Arial, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+}
+
+html.jobs-mode body {
+  font-family: var(--jobs-font-sans);
+  letter-spacing: -0.005em;
+  -webkit-font-smoothing: antialiased;
+}
+
+html.jobs-mode .rounded-xl {
+  border-radius: var(--jobs-radius-card);
+}
+
+html.jobs-mode .rounded-lg {
+  border-radius: var(--jobs-radius-button);
+}
+
+html.jobs-mode .rounded-md {
+  border-radius: var(--jobs-radius-input);
+}
+
+html.jobs-mode .shadow-sm {
+  box-shadow: var(--jobs-shadow-soft);
+}
+
+html.jobs-mode .shadow-md {
+  box-shadow: var(--jobs-shadow-soft), var(--jobs-shadow-pop);
+}
+
+html.jobs-mode *:not(.allow-anim) {
+  transition-property: opacity, color, background-color;
+  transition-duration: var(--jobs-motion-fade);
+}
+
 @layer utilities {
   .host-drag-region {
     -webkit-app-region: drag;

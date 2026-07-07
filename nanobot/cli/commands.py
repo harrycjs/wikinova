@@ -1466,6 +1466,43 @@ def _run_gateway(
                 prune_dream_sessions(agent.sessions.sessions_dir)
             return None
 
+        # Wiki evolution: extract new facts from history.jsonl into the wiki.
+        if job.name == "wiki_evolve":
+            try:
+                from nanobot.agent.wiki import WikiEvolution, WikiPaths, WikiStore
+                from nanobot.agent.wiki.tools import build_wiki_tool_registry
+
+                wiki_cfg = config.tools.wiki
+                paths = WikiPaths.from_workspace(config.workspace_path)
+                store = WikiStore(paths)
+                evolution = WikiEvolution(
+                    store,
+                    agent.context.memory,
+                    max_batch_entries=wiki_cfg.evolution.max_batch_entries,
+                    max_pages_per_run=wiki_cfg.evolution.max_pages_per_run,
+                )
+                result = await evolution.run_once(agent)
+                logger.info(
+                    "Wiki evolution: ran={} cursor={}→{} pages={} summary={}",
+                    result.ran,
+                    result.cursor_before,
+                    result.cursor_after,
+                    len(result.pages_changed),
+                    result.summary,
+                )
+            except Exception:
+                logger.exception("wiki evolution cron job failed")
+            return None
+
+        # Knowledge sync: IMA → Obsidian → Wiki
+        if job.name == "knowledge_sync":
+            try:
+                from nanobot.agent.knowledge.cron import run_knowledge_sync
+                await run_knowledge_sync(config, agent)
+            except Exception:
+                logger.exception("knowledge_sync cron job failed")
+            return None
+
         # Heartbeat is a system job that checks HEARTBEAT.md for active tasks.
         if job.name == "heartbeat":
             heartbeat_file = config.workspace_path / "HEARTBEAT.md"
@@ -1662,6 +1699,38 @@ def _run_gateway(
             ),
             payload=CronPayload(kind="system_event"),
         ))
+
+    # Register wiki-evolve system job (idempotent on restart). Reads recent
+    # history.jsonl entries and crystallizes new facts / preferences into the
+    # LLM-generated wiki. Cursors only advance on real file diffs.
+    wiki_cfg = config.tools.wiki
+    if wiki_cfg.enabled and wiki_cfg.evolution.enabled:
+        from nanobot.cron.types import CronSchedule as _CronSchedule  # local alias
+        cron.register_system_job(CronJob(
+            id="wiki_evolve",
+            name="wiki_evolve",
+            schedule=_CronSchedule(
+                kind="every",
+                every_ms=wiki_cfg.evolution.interval_h * 3_600_000,
+                tz=config.agents.defaults.timezone,
+            ),
+            payload=CronPayload(kind="system_event"),
+        ))
+        console.print(
+            f"[green]✓[/green] Wiki evolution: every {wiki_cfg.evolution.interval_h}h"
+        )
+
+    # Knowledge sync: IMA → Obsidian → Wiki every 6h
+    ima_cfg = getattr(config.tools, "ima", None)
+    obs_cfg = getattr(config.tools, "obsidian", None)
+    if getattr(ima_cfg, "enabled", False) or getattr(obs_cfg, "enabled", False):
+        cron.register_system_job(CronJob(
+            id="knowledge_sync",
+            name="knowledge_sync",
+            schedule=CronSchedule(kind="every", every_ms=6 * 3_600_000, tz=config.agents.defaults.timezone),
+            payload=CronPayload(kind="system_event"),
+        ))
+        console.print("[green]✓[/green] Knowledge sync (IMA→Obsidian→Wiki): every 6h")
 
     async def _open_browser_when_ready() -> None:
         """Wait for the gateway to bind, then point the user's browser at the webui."""

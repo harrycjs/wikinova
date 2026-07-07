@@ -72,10 +72,11 @@ class ContextBuilder:
         include_memory_recent_history: bool = True,
         session_key: str | None = None,
         unified_session: bool = False,
+        qa_mode: bool = False,
     ) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
         root = workspace or self.workspace
-        parts = [self._get_identity(channel=channel, workspace=root)]
+        parts = [self._get_identity(channel=channel, workspace=root, qa_mode=qa_mode)]
 
         bootstrap = self._load_bootstrap_files(root)
         if bootstrap:
@@ -116,15 +117,16 @@ class ContextBuilder:
 
         return "\n\n---\n\n".join(parts)
 
-    def _get_identity(self, channel: str | None = None, workspace: Path | None = None) -> str:
+    def _get_identity(self, channel: str | None = None, workspace: Path | None = None, qa_mode: bool = False) -> str:
         """Get the core identity section."""
         root = workspace or self.workspace
         workspace_path = str(root.expanduser().resolve())
         system = platform.system()
         runtime = f"{'macOS' if system == 'Darwin' else system} {platform.machine()}, Python {platform.python_version()}"
 
+        identity_template = "agent/identity_qa.md" if qa_mode else "agent/identity.md"
         return render_template(
-            "agent/identity.md",
+            identity_template,
             workspace_path=workspace_path,
             runtime=runtime,
             platform_policy=render_template("agent/platform_policy.md", system=system),
@@ -204,6 +206,7 @@ class ContextBuilder:
         include_memory_recent_history: bool = True,
         session_key: str | None = None,
         unified_session: bool = False,
+        qa_mode: bool = False,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
         root = workspace or self.workspace
@@ -242,6 +245,7 @@ class ContextBuilder:
                     include_memory_recent_history=include_memory_recent_history,
                     session_key=session_key,
                     unified_session=unified_session,
+                    qa_mode=qa_mode,
                 ),
             },
             *history,

@@ -34,12 +34,19 @@ if TYPE_CHECKING:
 
 
 def _default_webui_dist() -> Path | None:
-    """Return the absolute path to the bundled webui dist directory if it exists."""
+    """Return the absolute path to the bundled webui dist directory if it exists.
+
+    The webui build output lives at ``<package>/web/dist`` (i.e. inside the
+    ``nanobot`` package directory itself), as configured by
+    ``webui/vite.config.ts`` (``outDir: '../nanobot/web/dist'`` from
+    ``webui/``).
+    """
     try:
-        import nanobot.web as web_pkg  # type: ignore[import-not-found]
+        import nanobot
     except ImportError:
         return None
-    candidate = Path(web_pkg.__file__).resolve().parent / "dist"
+    pkg_root = Path(nanobot.__file__).resolve().parent
+    candidate = pkg_root / "web" / "dist"
     return candidate if candidate.is_dir() else None
 
 

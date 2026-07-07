@@ -29,6 +29,14 @@ from loguru import logger
 from pydantic import Field
 
 from nanobot.bus.events import OutboundMessage
+def atomic_json_write(path: Path, data: Any) -> None:
+    """Atomically write JSON data to a file (temp + fsync + replace)."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+    with open(path, "ab") as fh:
+        fh.flush()
+        os.fsync(fh.fileno())
 from nanobot.bus.outbound_events import ProgressEvent
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
@@ -46,6 +54,60 @@ ITEM_IMAGE = 2
 ITEM_VOICE = 3
 ITEM_FILE = 4
 ITEM_VIDEO = 5
+
+
+class ContextTokenStore:
+    """Disk-backed context_token cache keyed by user_id.
+
+    Persists to ``<state_dir>/context_tokens.json``.  Tokens expire
+    server-side after ~90-160s; by writing them to disk we survive gateway
+    restarts.  On startup ``restore()`` reloads the cache; on each inbound
+    ``set()`` writes the token to disk so it's available after restart.
+    """
+
+    def __init__(self, state_dir: Path):
+        self._state_dir = state_dir
+        self._cache: dict[str, str] = {}
+
+    def _path(self) -> Path:
+        return self._state_dir / "context_tokens.json"
+
+    def restore(self) -> None:
+        """Load persisted tokens into the in-memory cache."""
+        path = self._path()
+        if not path.exists():
+            return
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning("weixin: failed to restore context tokens: %s", exc)
+            return
+        restored = 0
+        for key, token in data.items():
+            if isinstance(token, str) and token:
+                self._cache[key] = token
+                restored += 1
+        if restored:
+            logger.info("weixin: restored %d context token(s)", restored)
+
+    def get(self, user_id: str) -> str | None:
+        return self._cache.get(user_id)
+
+    def set(self, user_id: str, token: str) -> None:
+        self._cache[user_id] = token
+        self._persist()
+
+    def remove(self, user_id: str) -> None:
+        self._cache.pop(user_id, None)
+        self._persist()
+
+    def _persist(self) -> None:
+        try:
+            self._state_dir.mkdir(parents=True, exist_ok=True)
+            atomic_json_write(self._path(), self._cache)
+        except Exception as exc:
+            logger.warning("weixin: failed to persist context tokens: %s", exc)
+
 
 # MessageType  (1 = inbound from user, 2 = outbound from bot)
 MESSAGE_TYPE_BOT = 2
@@ -164,7 +226,7 @@ class WeixinChannel(BaseChannel):
         # State
         self._client: httpx.AsyncClient | None = None
         self._get_updates_buf: str = ""
-        self._context_tokens: dict[str, str] = {}  # from_user_id -> context_token
+        self._token_store: ContextTokenStore = None  # initialized in start()
         self._processed_ids: OrderedDict[str, None] = OrderedDict()
         self._state_dir: Path | None = None
         self._token: str = ""
@@ -173,7 +235,7 @@ class WeixinChannel(BaseChannel):
         self._session_pause_until: float = 0.0
         self._typing_tasks: dict[str, asyncio.Task] = {}
         self._typing_tickets: dict[str, dict[str, Any]] = {}
-        self._context_token_at: dict[str, float] = {}
+        self._context_token_at: dict[str, float] = {}  # kept for age tracking only
         self._pending_tool_hints: dict[str, list[str]] = {}
         # Buffers streamed content deltas per chat. WeChat iLink has no native
         # incremental delivery, so when streaming is enabled we accumulate the
@@ -204,15 +266,12 @@ class WeixinChannel(BaseChannel):
             data = json.loads(state_file.read_text())
             self._token = data.get("token", "")
             self._get_updates_buf = data.get("get_updates_buf", "")
+            # Restore context tokens from legacy state file
             context_tokens = data.get("context_tokens", {})
             if isinstance(context_tokens, dict):
-                self._context_tokens = {
-                    str(user_id): str(token)
-                    for user_id, token in context_tokens.items()
-                    if str(user_id).strip() and str(token).strip()
-                }
-            else:
-                self._context_tokens = {}
+                for uid, tok in context_tokens.items():
+                    if isinstance(tok, str) and tok.strip():
+                        self._token_store.set(str(uid), str(tok))
             typing_tickets = data.get("typing_tickets", {})
             if isinstance(typing_tickets, dict):
                 self._typing_tickets = {
@@ -236,7 +295,7 @@ class WeixinChannel(BaseChannel):
             data = {
                 "token": self._token,
                 "get_updates_buf": self._get_updates_buf,
-                "context_tokens": self._context_tokens,
+                "context_tokens": {},
                 "typing_tickets": self._typing_tickets,
                 "base_url": self.config.base_url,
             }
@@ -485,6 +544,11 @@ class WeixinChannel(BaseChannel):
             follow_redirects=True,
         )
 
+        # Initialize disk-backed context_token store (survives restarts)
+        state_dir = self._get_state_dir()
+        self._token_store = ContextTokenStore(state_dir)
+        self._token_store.restore()
+
         if self.config.token:
             self._token = self.config.token
         elif not self._load_state():
@@ -647,12 +711,9 @@ class WeixinChannel(BaseChannel):
                 )
                 return
 
-            had_ctx_token = from_user_id in self._context_tokens
-            previous_ctx_token = self._context_tokens.get(from_user_id, "")
-            had_ctx_token_at = from_user_id in self._context_token_at
-            previous_ctx_token_at = self._context_token_at.get(from_user_id, 0.0)
-            self._context_tokens[from_user_id] = ctx_token
-            self._context_token_at[from_user_id] = time.time()
+            old_token = self._token_store.get(from_user_id)
+            # Keep context_token for outbound (send needs it)
+            self._token_store.set(from_user_id, ctx_token)
             try:
                 await self._handle_message(
                     sender_id=from_user_id,
@@ -661,21 +722,13 @@ class WeixinChannel(BaseChannel):
                     metadata={"message_id": msg_id},
                     is_dm=True,
                 )
-            finally:
-                if had_ctx_token:
-                    self._context_tokens[from_user_id] = previous_ctx_token
-                else:
-                    self._context_tokens.pop(from_user_id, None)
-                if had_ctx_token_at:
-                    self._context_token_at[from_user_id] = previous_ctx_token_at
-                else:
-                    self._context_token_at.pop(from_user_id, None)
+            except Exception:
+                pass  # Don't let errors block token persistence
             return
 
         # Cache context_token (required for all replies — inbound.ts:23-27)
         if ctx_token:
-            self._context_tokens[from_user_id] = ctx_token
-            self._context_token_at[from_user_id] = time.time()
+            self._token_store.set(from_user_id, ctx_token)
             self._save_state()
 
         # Parse item_list (WeixinMessage.item_list — types.ts:161)
@@ -994,10 +1047,10 @@ class WeixinChannel(BaseChannel):
             return context_token
 
         now = time.time()
-        cached_at = self._context_token_at.get(chat_id, 0)
+        cached_at = self._token_store._cache.get(chat_id, "") and self._context_token_at.get(chat_id, 0)
         age = now - cached_at
 
-        if age < CONTEXT_TOKEN_MAX_AGE_S:
+        if age < 30:
             return context_token
 
         self.logger.debug(
@@ -1033,11 +1086,16 @@ class WeixinChannel(BaseChannel):
                 chat_id,
                 age,
             )
-            self._context_tokens[chat_id] = new_token
-            self._context_token_at[chat_id] = now
+            self._token_store.set(chat_id, new_token)
             self._save_state()
             return new_token
 
+        self.logger.warning(
+            "WeChat context_token refresh returned same token for {}; "
+            "token may be stale (age {:.0f}s). Proceeding with caution.",
+            chat_id,
+            age,
+        )
         return context_token
 
     async def _flush_tool_hints(self, chat_id: str) -> None:
@@ -1057,7 +1115,7 @@ class WeixinChannel(BaseChannel):
             chat_id,
         )
 
-        ctx_token = self._context_tokens.get(chat_id, "")
+        ctx_token = self._token_store.get(chat_id) or ""
         ctx_token = await self._refresh_context_token_if_stale(chat_id, ctx_token)
         if not ctx_token:
             self.logger.warning(
@@ -1144,12 +1202,16 @@ class WeixinChannel(BaseChannel):
         if not is_progress:
             await self._stop_typing(msg.chat_id, clear_remote=True)
 
-        ctx_token = self._context_tokens.get(msg.chat_id, "")
-        ctx_token = await self._refresh_context_token_if_stale(msg.chat_id, ctx_token)
+        ctx_token = self._token_store.get(msg.chat_id) or ""
         if not ctx_token:
             raise RuntimeError(
-                f"WeChat context_token missing for chat_id={msg.chat_id}, cannot send"
+                f"WeChat context_token missing for chat_id={msg.chat_id}, cannot send. "
+                "Wait for next inbound message to obtain a fresh token."
             )
+        # Always attempt refresh to avoid stale tokens (WeChat drops silently on expired tokens).
+        refreshed = await self._refresh_context_token_if_stale(msg.chat_id, ctx_token)
+        if refreshed:
+            ctx_token = refreshed
 
         typing_ticket = ""
         with suppress(Exception):
@@ -1361,6 +1423,10 @@ class WeixinChannel(BaseChannel):
         data = await self._api_post("ilink/bot/sendmessage", body)
         ret = data.get("ret", 0)
         errcode = data.get("errcode", 0)
+        self.logger.debug(
+            "WeChat sendmessage response: ret={} errcode={} errmsg={} to_user={}",
+            ret, errcode, data.get("errmsg", ""), to_user_id,
+        )
         if (ret is not None and ret != 0) or (errcode is not None and errcode != 0):
             raise RuntimeError(
                 f"WeChat send text error (ret={ret}, errcode={errcode}): {data.get('errmsg', '')}"

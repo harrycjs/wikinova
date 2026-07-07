@@ -55,6 +55,10 @@
       "ariaLabel": "Change language"
     },
     "apps": "Apps",
+    "channels": "Channels",
+    "models": "Models",
+    "wiki": "Wiki",
+    "plugins": "Plugins",
     "automations": "Automations",
     "skills": {
       "title": "Skills"
@@ -1083,5 +1087,82 @@
       "usePath": "Use Path",
       "absolutePathRequired": "Enter an absolute folder path on this machine."
     }
+  },
+  "wiki": {
+    "title": "Knowledge Wiki",
+    "empty": {
+      "detail": "Select a page from the list to view its content."
+    },
+    "browse": {
+      "tab": "Browse"
+    },
+    "search": {
+      "placeholder": "Search pages…"
+    },
+    "page": {
+      "backlinks": "Backlinks",
+      "tags": "Tags",
+      "updatedAt": "Updated {{date}}",
+      "createdAt": "Created {{date}}"
+    },
+    "evolution": {
+      "title": "Evolution Log",
+      "empty": "No evolution runs yet.",
+      "runNow": "Run evolution now"
+    },
+    "delete": {
+      "confirm": "Delete page {{slug}}?",
+      "selected": "{{count}} page(s) selected"
+    },
+    "list": {
+      "empty": "No pages yet. Add notes via IMA to seed the wiki."
+    }
+  },
+  "channels": {
+    "title": "Channels",
+    "overview": {
+      "tab": "Overview"
+    },
+    "ima": {
+      "tab": "IMA",
+      "apiBase": "API Base",
+      "clientId": "Client ID",
+      "apiKey": "API Key",
+      "hasCredentials": "Credentials",
+      "ready": "Ready to sync",
+      "credentialsMissing": "Credentials missing",
+      "syncNow": "Sync now"
+    },
+    "obsidian": {
+      "tab": "Obsidian",
+      "vaultPath": "Vault path",
+      "mode": "Mode",
+      "fileCount": "Files",
+      "files": "files",
+      "vaultNotConfigured": "Vault path not configured",
+      "resync": "Resync vault"
+    },
+    "save": "Save config"
+  },
+  "models": {
+    "title": "Models",
+    "active": "Active",
+    "empty": "No models configured."
+  },
+  "plugins": {
+    "title": "Plugins",
+    "channel": "Channels",
+    "provider": "Providers",
+    "tool": "Tools",
+    "name": "Name",
+    "version": "Version",
+    "description": "Description",
+    "empty": "No plugins installed.",
+    "uninstallConfirm": "Uninstall {{name}}?"
+  },
+  "skills": {
+    "title": "Skills",
+    "selectPrompt": "Select a skill from the list.",
+    "empty": "No skills available."
   }
 }

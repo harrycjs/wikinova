@@ -186,6 +186,7 @@ class AgentLoop:
         (TurnState.COMMAND, "dispatch"): TurnState.BUILD,
         (TurnState.COMMAND, "shortcut"): TurnState.DONE,
         (TurnState.BUILD, "ok"): TurnState.RUN,
+        (TurnState.BUILD, "qa_refused"): TurnState.SAVE,
         (TurnState.RUN, "ok"): TurnState.SAVE,
         (TurnState.SAVE, "ok"): TurnState.RESPOND,
         (TurnState.RESPOND, "ok"): TurnState.DONE,
@@ -228,6 +229,8 @@ class AgentLoop:
         runtime_model_publisher: Callable[[str, str | None], None] | None = None,
         restart_mode: str = "auto",
         local_trigger_store: Any | None = None,
+        qa_mode: bool = False,
+        qa_gate_enabled: bool = True,
     ):
         from nanobot.config.schema import ToolsConfig
 
@@ -286,6 +289,8 @@ class AgentLoop:
         self._extra_hooks: list[AgentHook] = hooks or []
 
         self.context = ContextBuilder(workspace, timezone=timezone, disabled_skills=disabled_skills)
+        self._qa_mode = qa_mode
+        self._qa_gate_enabled = qa_gate_enabled and qa_mode
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
         # One file-read/write tracker per logical session. The tool registry is
@@ -423,6 +428,8 @@ class AgentLoop:
             restart_mode=config.gateway.restart_mode,
             provider_snapshot_loader=provider_snapshot_loader,
             preset_snapshot_loader=preset_snapshot_loader,
+            qa_mode=defaults.qa_mode,
+            qa_gate_enabled=defaults.qa_gate_enabled,
             **extra,
         )
 
@@ -540,7 +547,34 @@ class AgentLoop:
             )
             registered.append("my")
 
+        # Register Q&A wiki + Obsidian tools for the main agent. These are not
+        # auto-discovered as plugin tools because they depend on a WikiStore
+        # singleton that the loop owns.
+        self._register_qa_tools(ctx)
+
         logger.info("Registered {} tools: {}", len(registered), registered)
+
+    def _register_qa_tools(self, ctx) -> None:
+        """Register reader-role wiki + Obsidian tools for the main Q&A agent."""
+        from nanobot.agent.wiki import WikiPaths, WikiQuerier, WikiStore, build_wiki_tool_registry
+
+        wiki_cfg = getattr(self.tools_config, "wiki", None)
+        if wiki_cfg is None or not getattr(wiki_cfg, "enabled", True):
+            return
+        try:
+            paths = WikiPaths.from_workspace(self.workspace)
+            store = WikiStore(paths)
+            querier = WikiQuerier(store)
+            registry = build_wiki_tool_registry(store, role="reader")
+            for name, tool in registry._tools.items():
+                if not self.tools.has(name):
+                    self.tools.register(tool)
+                    logger.debug("Registered wiki tool: {}", name)
+            # Wire the querier into the wiki search/read tools so cache stays fresh.
+            # ``WikiSearchTool`` and ``WikiReadTool`` already hold a reference to
+            # the same querier, so we're done here.
+        except Exception:  # noqa: BLE001
+            logger.exception("failed to register wiki tools")
 
     async def _connect_mcp(self) -> None:
         """Connect configured MCP servers."""
@@ -675,6 +709,7 @@ class AgentLoop:
             include_memory_recent_history=include_memory_recent_history,
             session_key=session.key,
             unified_session=self._unified_session,
+            qa_mode=self._qa_mode,
         )
 
     async def _dispatch_command_inline(
@@ -1552,6 +1587,37 @@ class AgentLoop:
             ctx.on_progress = await self._build_bus_progress_callback(ctx.msg)
         if ctx.on_retry_wait is None:
             ctx.on_retry_wait = await self._build_retry_wait_callback(ctx.msg)
+
+        # Pre-LLM Q&A gate (only when qa_mode + qa_gate_enabled). Cheap
+        # pattern-based classifier refuses clearly off-topic requests
+        # before consuming an LLM turn. Bot/internal/system channels and
+        # ephemeral automation turns are exempt — they bypass the gate.
+        if (
+            self._qa_gate_enabled
+            and not ctx.ephemeral
+            and ctx.msg.channel not in {"system", "api"}
+            and not getattr(ctx.msg, "_qa_gate_skip", False)
+        ):
+            from nanobot.agent.qa_gate import quick_classify
+
+            decision = quick_classify(ctx.msg.content)
+            if not decision.proceed:
+                logger.info(
+                    "QA gate refused channel={} intent={} confidence={:.2f}: {}",
+                    ctx.msg.channel,
+                    decision.intent,
+                    decision.confidence,
+                    (ctx.msg.content or "")[:80],
+                )
+                ctx.final_content = decision.refusal or ""
+                ctx.all_messages = [
+                    {"role": "assistant", "content": ctx.final_content, "_qa_gate": True},
+                ]
+                ctx.tools_used = []
+                ctx.stop_reason = "qa_refused"
+                ctx.save_skip = 0
+                # _persist_user_message_early already saved the user message.
+                return "qa_refused"
 
         return "ok"
 

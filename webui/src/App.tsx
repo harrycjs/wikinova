@@ -13,6 +13,12 @@ import { RenameChatDialog } from "@/components/RenameChatDialog";
 import { Sidebar } from "@/components/Sidebar";
 import { SessionSearchDialog } from "@/components/SessionSearchDialog";
 import { SettingsView, type SettingsSectionKey } from "@/components/settings/SettingsView";
+import { ChannelsView } from "@/components/channels/ChannelsView";
+import { ModelsView } from "@/components/models/ModelsView";
+import { SkillsView as NewSkillsView } from "@/components/skills/SkillsView";
+import { PluginsView } from "@/components/plugins/PluginsView";
+import { WikiView } from "@/components/wiki/WikiView";
+import { setApiToken } from "@/lib/api-client";
 import { ThreadShell } from "@/components/thread/ThreadShell";
 import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet";
 
@@ -73,7 +79,8 @@ const SIDEBAR_RAIL_WIDTH = 56;
 const MOBILE_SIDEBAR_WIDTH = `min(${SIDEBAR_WIDTH}px, calc(100vw - 0.75rem))`;
 const TOKEN_REFRESH_MARGIN_MS = 30_000;
 const TOKEN_REFRESH_MIN_DELAY_MS = 5_000;
-type ShellView = "chat" | "settings" | "apps" | "automations" | "skills";
+type ShellView = "chat" | "settings" | "apps" | "automations" | "skills"
+  | "channels" | "models" | "wiki" | "plugins";
 type ShellRoute = {
   view: ShellView;
   activeKey: string | null;
@@ -137,6 +144,18 @@ function readShellRoute(): ShellRoute {
   }
   if (path === "/skills") {
     return { view: "skills", activeKey, settingsSection: "skills" };
+  }
+  if (path === "/channels") {
+    return { view: "channels", activeKey, settingsSection: "overview" };
+  }
+  if (path === "/models") {
+    return { view: "models", activeKey, settingsSection: "models" };
+  }
+  if (path === "/wiki") {
+    return { view: "wiki", activeKey, settingsSection: "overview" };
+  }
+  if (path === "/plugins") {
+    return { view: "plugins", activeKey, settingsSection: "apps" };
   }
   if (path.startsWith("/chat/")) {
     const encoded = path.slice("/chat/".length);
@@ -346,6 +365,7 @@ export default function App() {
   const refreshReadyClient = useCallback(
     async (client: NanobotClient, fallbackSurface: RuntimeSurface) => {
       const boot = await fetchBootstrap("", bootstrapSecretRef.current);
+      setApiToken(boot.token);
       const url = deriveWsUrl(boot.ws_path, boot.token, boot.ws_url);
       const runtimeSurface = boot.runtime_surface
         ? toRuntimeSurface(boot.runtime_surface)
@@ -382,6 +402,7 @@ export default function App() {
           const boot = await fetchBootstrap("", secret);
           if (cancelled) return;
           if (secret) saveSecret(secret);
+          setApiToken(boot.token);
           const url = deriveWsUrl(boot.ws_path, boot.token, boot.ws_url);
           const runtimeSurface = toRuntimeSurface(boot.runtime_surface);
           const runtimeHost = createRuntimeHost(runtimeSurface, boot.runtime_capabilities);
@@ -1198,6 +1219,30 @@ function Shell({
     setMobileSidebarOpen(false);
   }, [activeKey, navigate]);
 
+  const onOpenChannels = useCallback(() => {
+    setSessionSearchOpen(false);
+    navigate({ view: "channels", activeKey, settingsSection: "overview" });
+    setMobileSidebarOpen(false);
+  }, [activeKey, navigate]);
+
+  const onOpenModels = useCallback(() => {
+    setSessionSearchOpen(false);
+    navigate({ view: "models", activeKey, settingsSection: "models" });
+    setMobileSidebarOpen(false);
+  }, [activeKey, navigate]);
+
+  const onOpenWiki = useCallback(() => {
+    setSessionSearchOpen(false);
+    navigate({ view: "wiki", activeKey, settingsSection: "overview" });
+    setMobileSidebarOpen(false);
+  }, [activeKey, navigate]);
+
+  const onOpenPlugins = useCallback(() => {
+    setSessionSearchOpen(false);
+    navigate({ view: "plugins", activeKey, settingsSection: "apps" });
+    setMobileSidebarOpen(false);
+  }, [activeKey, navigate]);
+
   const onSettingsSectionChange = useCallback(
     (section: SettingsSectionKey) => {
       navigate({
@@ -1379,6 +1424,22 @@ function Shell({
       });
       return;
     }
+    if (view === "channels") {
+      document.title = t("app.documentTitle.chat", { title: t("channels.title") });
+      return;
+    }
+    if (view === "models") {
+      document.title = t("app.documentTitle.chat", { title: t("models.title") });
+      return;
+    }
+    if (view === "wiki") {
+      document.title = t("app.documentTitle.chat", { title: t("wiki.title") });
+      return;
+    }
+    if (view === "plugins") {
+      document.title = t("app.documentTitle.chat", { title: t("plugins.title") });
+      return;
+    }
     document.title = activeSession
       ? t("app.documentTitle.chat", { title: headerTitle })
       : t("app.documentTitle.base");
@@ -1401,8 +1462,16 @@ function Shell({
     onOpenApps,
     onOpenAutomations,
     onOpenSkills,
+    onOpenChannels,
+    onOpenModels,
+    onOpenWiki,
+    onOpenPlugins,
     onOpenSearch: onOpenSessionSearch,
-    activeUtility: view === "apps" || view === "automations" || view === "skills" ? view : null,
+    activeUtility:
+      view === "apps" || view === "automations" || view === "skills" ||
+      view === "channels" || view === "models" || view === "wiki" || view === "plugins"
+        ? view
+        : null,
     onToggleArchived,
     pinnedKeys: sidebarState.pinned_keys,
     archivedKeys: sidebarState.archived_keys,
@@ -1591,24 +1660,31 @@ function Shell({
             </div>
             {view !== "chat" && (
               <div className="absolute inset-0 flex flex-col">
-                <SettingsView
-                  theme={theme}
-                  initialSection={settingsInitialSection}
-                  initialSettings={settingsSnapshot}
-                  showSidebar={view === "settings"}
-                  onToggleTheme={toggle}
-                  onBackToChat={onBackToChat}
-                  onModelNameChange={onModelNameChange}
-                  onSettingsChange={setSettingsSnapshot}
-                  skills={skills}
-                  onWorkspaceSettingsChange={refreshWorkspaces}
-                  onSectionChange={onSettingsSectionChange}
-                  onLogout={onLogout}
-                  onRestart={onRestart}
-                  onNativeEngineRestart={onNativeEngineRestart}
-                  isRestarting={isRestarting}
-                  hostChromeInset={showHostChrome}
-                />
+                {view === "channels" && <ChannelsView />}
+                {view === "models" && <ModelsView />}
+                {view === "plugins" && <PluginsView />}
+                {view === "wiki" && <WikiView />}
+                {view === "skills" && <NewSkillsView />}
+                {view === "settings" && (
+                  <SettingsView
+                    theme={theme}
+                    initialSection={settingsInitialSection}
+                    initialSettings={settingsSnapshot}
+                    showSidebar={view === "settings"}
+                    onToggleTheme={toggle}
+                    onBackToChat={onBackToChat}
+                    onModelNameChange={onModelNameChange}
+                    onSettingsChange={setSettingsSnapshot}
+                    skills={skills}
+                    onWorkspaceSettingsChange={refreshWorkspaces}
+                    onSectionChange={onSettingsSectionChange}
+                    onLogout={onLogout}
+                    onRestart={onRestart}
+                    onNativeEngineRestart={onNativeEngineRestart}
+                    isRestarting={isRestarting}
+                    hostChromeInset={showHostChrome}
+                  />
+                )}
               </div>
             )}
           </main>

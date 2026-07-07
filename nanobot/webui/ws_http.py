@@ -734,6 +734,42 @@ class GatewayHTTPHandler:
             return self._handle_workspaces(connection, request)
         if got == "/api/webui/skills":
             return self._handle_webui_skills(request)
+        # Wiki / IMA / Obsidian / Plugins endpoints
+        if got == "/api/wiki/list":
+            return self._handle_wiki_list(request)
+        if got == "/api/wiki/evolution":
+            return self._handle_wiki_evolution(request)
+        if got == "/api/wiki/page":
+            query = _parse_query(request.path)
+            slug = _query_first(query, "slug") or ""
+            if slug:
+                return self._handle_wiki_page(request, slug)
+        if got == "/api/wiki/search":
+            return self._handle_wiki_search(request)
+        if got == "/api/wiki/regenerate":
+            return self._handle_wiki_regenerate(request)
+        if got == "/api/wiki/delete":
+            return self._handle_wiki_delete(request)
+        if got == "/api/ima/status":
+            return self._handle_ima_status(request)
+        if got == "/api/ima/sync":
+            return self._handle_ima_sync(request)
+        if got == "/api/obsidian/status":
+            return self._handle_obsidian_status(request)
+        if got == "/api/obsidian/resync":
+            return self._handle_obsidian_resync(request)
+        if got == "/api/plugins/list":
+            return self._handle_plugins_list(request)
+        if got == "/api/channels/save-config":
+            return self._handle_channels_save_config(request)
+        if got == "/api/channels/list":
+            return self._handle_channels_list(request)
+        if got == "/api/channels/config":
+            return self._handle_channels_config(request)
+        if got == "/api/weixin/qrcode":
+            return self._handle_weixin_qrcode(request)
+        if got == "/api/weixin/status":
+            return self._handle_weixin_status(request)
         m = re.match(r"^/api/webui/skills/([^/]+)$", got)
         if m:
             return self._handle_webui_skill_detail(request, m.group(1))
@@ -811,6 +847,636 @@ class GatewayHTTPHandler:
             return _http_error(500, "failed to write sidebar state")
         return _http_json_response(state)
 
+    # -- Wiki / IMA / Obsidian / Plugins routes -----------------------------
+
+    def _handle_wiki_list(self, request: WsRequest) -> Response:
+        from nanobot.agent.wiki import WikiPaths, WikiStore
+
+        workspace = Path(self.session_manager.workspace if self.session_manager else "~/.nanobot/workspace").expanduser().resolve()
+        try:
+            paths = WikiPaths.from_workspace(workspace)
+            store = WikiStore(paths)
+            pages = store.list_pages()
+            return _http_json_response(pages)
+        except Exception as e:
+            return _http_error(500, str(e))
+
+    def _handle_wiki_evolution(self, request: WsRequest) -> Response:
+        from nanobot.agent.wiki import WikiPaths, WikiStore
+
+        workspace = Path(self.session_manager.workspace if self.session_manager else "~/.nanobot/workspace").expanduser().resolve()
+        try:
+            paths = WikiPaths.from_workspace(workspace)
+            store = WikiStore(paths)
+            from nanobot.agent.wiki.evolution import WikiEvolution
+
+            evo = WikiEvolution(store, None)  # type: ignore[arg-type]
+            log = evo.read_recent_log()
+            return _http_json_response(log)
+        except Exception as e:
+            return _http_error(500, str(e))
+
+    def _handle_wiki_page(self, request: WsRequest, slug: str) -> Response:
+        from nanobot.agent.wiki import WikiPaths, WikiStore
+
+        workspace = Path(self.session_manager.workspace if self.session_manager else "~/.nanobot/workspace").expanduser().resolve()
+        try:
+            paths = WikiPaths.from_workspace(workspace)
+            store = WikiStore(paths)
+            page = store.read_page(slug)
+            if page is None:
+                return _http_error(404, "Page not found")
+            blinks = store.backlinks(slug)
+            data = page.to_dict()
+            data["body"] = page.body
+            data["frontmatter"] = page.fm.to_dict()
+            data["backlinks"] = blinks
+            return _http_json_response(data)
+        except Exception as e:
+            return _http_error(500, str(e))
+
+    def _handle_wiki_search(self, request: WsRequest) -> Response:
+        from nanobot.agent.wiki import WikiPaths, WikiQuerier, WikiStore
+
+        query = _parse_query(request.path)
+        q = _query_first(query, "q") or ""
+        workspace = Path(self.session_manager.workspace if self.session_manager else "~/.nanobot/workspace").expanduser().resolve()
+        try:
+            paths = WikiPaths.from_workspace(workspace)
+            store = WikiStore(paths)
+            querier = WikiQuerier(store)
+            hits = querier.search(q, k=5)
+            return _http_json_response([h.to_dict() for h in hits])
+        except Exception as e:
+            return _http_error(500, str(e))
+
+    def _handle_wiki_regenerate(self, request: WsRequest) -> Response:
+        return _http_json_response({"queued": True})
+
+    def _handle_wiki_delete(self, request: WsRequest) -> Response:
+        """Delete a wiki page by slug."""
+        if not self.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        query = _parse_query(request.path)
+        slug = _query_first(query, "slug") or ""
+        if not slug:
+            return _http_error(400, "slug is required")
+        try:
+            from nanobot.agent.wiki import WikiPaths, WikiStore
+            workspace = Path.home() / ".nanobot" / "workspace"
+            paths = WikiPaths.from_workspace(workspace)
+            store = WikiStore(paths)
+            deleted = store.delete_page(slug)
+            if deleted:
+                return _http_json_response({"ok": True, "deleted": slug})
+            else:
+                return _http_error(404, f"Page '{slug}' not found")
+        except Exception as e:
+            return _http_error(500, str(e))
+
+    def _handle_ima_status(self, request: WsRequest) -> Response:
+        """Read IMA status directly from config.json for live updates."""
+        import json as _json
+        config_path = Path.home() / ".nanobot" / "config.json"
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                cfg = _json.load(f)
+        except Exception:
+            cfg = {}
+        ima = cfg.get("tools", {}).get("ima", {})
+        has_creds = bool(ima.get("clientId") and ima.get("apiKey"))
+        return _http_json_response({
+            "enabled": ima.get("enabled", False),
+            "has_credentials": has_creds,
+            "base_url": ima.get("baseUrl", "https://ima.qq.com"),
+            "client_id": ima.get("clientId"),
+            "api_key": ima.get("apiKey"),
+        })
+
+    def _handle_ima_sync(self, request: WsRequest) -> Response:
+        """Run IMA sync: fetch notes from IMA API, create wiki pages."""
+        if not self.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+
+        import json as _json
+        import traceback
+        import hashlib
+
+        config_path = Path.home() / ".nanobot" / "config.json"
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                cfg = _json.load(f)
+        except Exception:
+            return _http_error(500, "cannot read config")
+
+        ima_cfg = cfg.get("tools", {}).get("ima", {})
+        client_id = ima_cfg.get("clientId")
+        api_key = ima_cfg.get("apiKey")
+        if not client_id or not api_key:
+            return _http_json_response({
+                "ok": False,
+                "log": ["ERROR: IMA credentials not configured. Set Client ID and API Key first."],
+            })
+
+        logs = []
+        try:
+            import httpx as _httpx
+
+            base_url = ima_cfg.get("baseUrl", "https://ima.qq.com")
+            headers = {
+                "ima-openapi-clientid": client_id,
+                "ima-openapi-apikey": api_key,
+                "Content-Type": "application/json",
+            }
+
+            # Step 1: List knowledge bases
+            logs.append("Fetching IMA knowledge bases...")
+            r = _httpx.post(
+                f"{base_url}/openapi/wiki/v1/search_knowledge_base",
+                json={"query": "", "cursor": "", "limit": 20},
+                headers=headers,
+                timeout=15,
+            )
+            data = r.json()
+            if data.get("code") != 0:
+                logs.append(f"ERROR: IMA API error: {data.get('msg', 'unknown')}")
+                return _http_json_response({"ok": False, "log": logs})
+
+            kbs = data.get("data", {}).get("info_list") or []
+            logs.append(f"Found {len(kbs)} knowledge bases")
+
+            from nanobot.agent.wiki import WikiPaths, WikiStore
+
+            workspace = Path.home() / ".nanobot" / "workspace"
+            paths = WikiPaths.from_workspace(workspace)
+            store = WikiStore(paths)
+            created = 0
+            skipped = 0
+
+            for kb in kbs:
+                kb_id = kb.get("kb_id", "")
+                kb_name = kb.get("kb_name", "unknown")
+                logs.append(f"\nKB: {kb_name} ({kb.get('content_count', '?')} items)")
+
+                try:
+                    kr = _httpx.post(
+                        f"{base_url}/openapi/wiki/v1/get_knowledge_list",
+                        json={"knowledge_base_id": kb_id, "cursor": "", "limit": 50},
+                        headers=headers,
+                        timeout=15,
+                    )
+                    kd = kr.json()
+                    if kd.get("code") != 0:
+                        logs.append(f"  ERROR: {kd.get('msg')}")
+                        continue
+                    items = kd.get("data", {}).get("list") or kd.get("data", {}).get("knowledge_list") or []
+                    logs.append(f"  Found {len(items)} items")
+                except Exception as e:
+                    logs.append(f"  ERROR: {e}")
+                    continue
+
+                for item in items[:10]:
+                    media_id = item.get("media_id") or item.get("id") or ""
+                    title = item.get("title") or item.get("name") or "Untitled"
+                    if not media_id:
+                        skipped += 1
+                        continue
+
+                    content = ""
+                    source_url = ""
+
+                    # Try get_doc_content first (for note-type items)
+                    try:
+                        nr = _httpx.post(
+                            f"{base_url}/openapi/note/v1/get_doc_content",
+                            json={"note_id": media_id, "target_content_format": 0},
+                            headers=headers,
+                            timeout=15,
+                        )
+                        nd = nr.json()
+                        if nd.get("code") == 0:
+                            nd_data = nd.get("data", {})
+                            content = nd_data.get("content") or nd_data.get("doc_content") or nd_data.get("text") or ""
+                    except Exception:
+                        pass
+
+                    # If no content, get URL from get_media_info and fetch it
+                    if not content:
+                        try:
+                            mr = _httpx.post(
+                                f"{base_url}/openapi/wiki/v1/get_media_info",
+                                json={"media_id": media_id},
+                                headers=headers,
+                                timeout=15,
+                            )
+                            md = mr.json()
+                            if md.get("code") == 0:
+                                md_data = md.get("data", {})
+                                url_info = md_data.get("url_info") or {}
+                                source_url = url_info.get("url") or ""
+                                if source_url:
+                                    logs.append(f"    Fetching URL: {source_url[:60]}...")
+                                    try:
+                                        # Try multiple extraction methods
+                                        content = ""
+
+                                        # Method 1: Jina Reader API with proper headers
+                                        try:
+                                            jina_url = f"https://r.jina.ai/{source_url}"
+                                            resp = _httpx.get(jina_url, timeout=30, follow_redirects=True, headers={
+                                                "Accept": "text/plain",
+                                                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                                            })
+                                            if resp.status_code == 200 and len(resp.text) > 100:
+                                                content = resp.text.strip()[:8000]
+                                        except Exception:
+                                            pass
+
+                                        # Method 2: Direct fetch with HTML extraction
+                                        if not content or "验证" in content[:100] or len(content) < 100:
+                                            try:
+                                                resp2 = _httpx.get(source_url, timeout=15, follow_redirects=True, headers={
+                                                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                                                })
+                                                if resp2.status_code == 200:
+                                                    raw_html = resp2.text
+                                                    # Try multiple extraction patterns
+                                                    for pattern in [
+                                                        r'<div[^>]*class="rich_media_content[^"]*"[^>]*>(.*?)</div>',
+                                                        r'<div[^>]*id="js_content"[^>]*>(.*?)</div>',
+                                                        r'<article[^>]*>(.*?)</article>',
+                                                    ]:
+                                                        body_match = re.search(pattern, raw_html, re.DOTALL)
+                                                        if body_match:
+                                                            content = re.sub(r"<[^>]+>", " ", body_match.group(1))
+                                                            content = re.sub(r"\s+", " ", content).strip()[:8000]
+                                                            break
+                                                    if not content:
+                                                        content = re.sub(r"<[^>]+>", " ", raw_html)
+                                                        content = re.sub(r"\s+", " ", content).strip()[:8000]
+                                            except Exception:
+                                                pass
+                                    except Exception as ue:
+                                        logs.append(f"    WARN: URL fetch failed: {ue}")
+                        except Exception:
+                            pass
+
+                    if not content.strip():
+                        # Store as reference with URL
+                        content = f"Source: {source_url}" if source_url else "(no content available)"
+                        logs.append(f"  INFO: {title[:40]} (URL reference only)")
+
+                    try:
+                        slug = re.sub(r"[^a-z0-9-]", "", title.lower().strip().replace(" ", "-"))
+                        if not slug:
+                            slug = f"ima-{hashlib.md5(title.encode()).hexdigest()[:8]}"
+                        slug = slug[:80]
+
+                        # Save to Obsidian vault
+                        obs_cfg = cfg.get("tools", {}).get("obsidian", {})
+                        vault_path = obs_cfg.get("vaultPath")
+                        if vault_path:
+                            vault = Path(vault_path).expanduser().resolve()
+                            obsidian_dir = vault / "Nanobot" / "Inbox"
+                            obsidian_dir.mkdir(parents=True, exist_ok=True)
+                            date_prefix = __import__("datetime").datetime.now().strftime("%Y-%m-%d")
+                            file_path = obsidian_dir / f"{date_prefix}-{slug}.md"
+                            file_content = f"---\ntitle: \"{title}\"\nsource: ima:{media_id}\ncaptured_at: {__import__('datetime').datetime.now().isoformat()}\n---\n\n{content[:8000]}"
+                            file_path.write_text(file_content, encoding="utf-8")
+                            logs.append(f"  OK: {title[:40]} → Obsidian/{file_path.name}")
+                            created += 1
+                        else:
+                            # No Obsidian configured, write directly to wiki
+                            store.write_page(slug=slug, title=title, body=content[:8000], tags=["ima", kb_name.lower()], source=f"ima:{media_id}")
+                            created += 1
+                            logs.append(f"  OK: {title[:40]} → wiki [{slug}]")
+                    except Exception as e:
+                        logs.append(f"  WARN: {title[:30]}: {e}")
+                        skipped += 1
+
+            logs.append(f"\nIMA sync complete: {created} created, {skipped} skipped")
+            return _http_json_response({"ok": True, "log": logs, "created": created, "skipped": skipped})
+
+        except Exception as e:
+            logs.append(f"FATAL: {traceback.format_exc()}")
+            return _http_json_response({"ok": False, "log": logs})
+
+    def _handle_obsidian_status(self, request: WsRequest) -> Response:
+        """Read Obsidian status directly from config.json for live updates."""
+        import json as _json
+        config_path = Path.home() / ".nanobot" / "config.json"
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                cfg = _json.load(f)
+        except Exception:
+            cfg = {}
+        obs = cfg.get("tools", {}).get("obsidian", {})
+        vault_path = obs.get("vaultPath")
+        file_count = 0
+        if vault_path:
+            vp = Path(vault_path).expanduser().resolve()
+            if vp.exists():
+                file_count = sum(1 for _ in vp.rglob("*.md"))
+        return _http_json_response({
+            "enabled": obs.get("enabled", False),
+            "vault_path": vault_path,
+            "last_sync_at": None,
+            "file_count": file_count,
+            "mode": obs.get("mode", "filesystem"),
+        })
+
+    def _handle_obsidian_resync(self, request: WsRequest) -> Response:
+        """Scan Obsidian vault for markdown files and create wiki pages."""
+        if not self.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+
+        import json as _json
+
+        config_path = Path.home() / ".nanobot" / "config.json"
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                cfg = _json.load(f)
+        except Exception:
+            return _http_error(500, "cannot read config")
+
+        obs_cfg = cfg.get("tools", {}).get("obsidian", {})
+        vault_path = obs_cfg.get("vaultPath")
+        if not vault_path:
+            return _http_json_response({"ok": False, "log": ["ERROR: Obsidian vault path not configured"]})
+
+        vault = Path(vault_path).expanduser().resolve()
+        if not vault.exists():
+            return _http_json_response({"ok": False, "log": [f"ERROR: Vault path does not exist: {vault_path}"]})
+
+        logs = []
+        try:
+            from nanobot.agent.wiki import WikiPaths, WikiStore
+
+            workspace = Path.home() / ".nanobot" / "workspace"
+            paths = WikiPaths.from_workspace(workspace)
+            store = WikiStore(paths)
+
+            # Find all markdown files in vault
+            md_files = sorted(vault.rglob("*.md"))
+            logs.append(f"Scanning vault: {vault_path} ({len(md_files)} markdown files)")
+
+            created = 0
+            skipped = 0
+
+            for md_file in md_files[:20]:  # limit for speed
+                try:
+                    content = md_file.read_text(encoding="utf-8", errors="replace")
+                except Exception as e:
+                    logs.append(f"  WARN: cannot read {md_file.name}: {e}")
+                    skipped += 1
+                    continue
+
+                if not content.strip():
+                    skipped += 1
+                    continue
+
+                # Parse frontmatter for original title
+                from nanobot.agent.wiki.frontmatter import parse_frontmatter
+                fm, body = parse_frontmatter(content)
+                title = fm.title or md_file.stem
+                # Derive slug from filename (strip date prefix, handle CJK)
+                stem = md_file.stem
+                stem = re.sub(r"^\d{4}-\d{2}-\d{2}-", "", stem)
+                raw_slug = stem.lower().replace(" ", "-")
+                safe_slug = re.sub(r"[^a-z0-9-]", "", raw_slug)
+                # Remove leading/trailing dashes
+                safe_slug = safe_slug.strip("-")
+                if not safe_slug or len(safe_slug) < 3:
+                    safe_slug = f"vault-{hashlib.md5(md_file.name.encode()).hexdigest()[:8]}"
+                slug = safe_slug[:80] or "unnamed"
+
+                try:
+                    # Strip frontmatter from body (wiki store adds its own)
+                    body_content = content
+                    if content.startswith("---"):
+                        _, body_content = parse_frontmatter(content)
+                    store.write_page(
+                        slug=slug,
+                        title=title,
+                        body=body_content[:8000],
+                        tags=["obsidian", "vault"],
+                        source=f"obsidian:{md_file.relative_to(vault).as_posix()}",
+                    )
+                    created += 1
+                    logs.append(f"  OK: {md_file.relative_to(vault)}")
+                except Exception as e:
+                    logs.append(f"  WARN: failed {md_file.name}: {e}")
+                    skipped += 1
+
+            logs.append(f"Obsidian sync complete: {created} created, {skipped} skipped")
+            return _http_json_response({"ok": True, "log": logs, "created": created, "skipped": skipped})
+
+        except Exception as e:
+            import traceback
+            logs.append(f"FATAL: {traceback.format_exc()}")
+            return _http_json_response({"ok": False, "log": logs})
+
+    def _handle_weixin_qrcode(self, request: WsRequest) -> Response:
+        """Start WeChat QR code login: fetch QR, return QR URL + qrcode_id for polling."""
+        if not self.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        try:
+            import httpx as _httpx
+            # Get WeChat base URL from config
+            import json as _json
+            config_path = Path.home() / ".nanobot" / "config.json"
+            with open(config_path, "r", encoding="utf-8") as f:
+                cfg = _json.load(f)
+            base_url = cfg.get("channels", {}).get("weixin", {}).get("baseUrl", "https://ilinkai.weixin.qq.com")
+
+            # Fetch QR code
+            resp = _httpx.get(f"{base_url}/ilink/bot/get_bot_qrcode", params={"bot_type": "3"}, timeout=15)
+            data = resp.json()
+            qrcode_id = data.get("qrcode", "")
+            qrcode_img = data.get("qrcode_img_content", "")
+            if not qrcode_id:
+                return _http_json_response({"ok": False, "error": "Failed to get QR code"})
+            return _http_json_response({"ok": True, "qrcode_id": qrcode_id, "qrcode_url": qrcode_img or qrcode_id})
+        except Exception as e:
+            return _http_json_response({"ok": False, "error": str(e)})
+
+    def _handle_weixin_status(self, request: WsRequest) -> Response:
+        """Poll WeChat QR code status. Returns status: wait/scaned/confirmed/expired."""
+        if not self.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        query = _parse_query(request.path)
+        qrcode_id = _query_first(query, "qrcode_id") or ""
+
+        # If no qrcode_id, return the current connection state
+        if not qrcode_id:
+            return _http_json_response(self._weixin_connection_state())
+
+        try:
+            import httpx as _httpx
+            import json as _json
+            config_path = Path.home() / ".nanobot" / "config.json"
+            with open(config_path, "r", encoding="utf-8") as f:
+                cfg = _json.load(f)
+            base_url = cfg.get("channels", {}).get("weixin", {}).get("baseUrl", "https://ilinkai.weixin.qq.com")
+
+            resp = _httpx.get(f"{base_url}/ilink/bot/get_qrcode_status", params={"qrcode": qrcode_id}, timeout=15)
+            data = resp.json()
+            status = data.get("status", "wait")
+            if status == "confirmed":
+                token = data.get("bot_token", "")
+                base = data.get("baseurl", "")
+                if token:
+                    cfg["channels"].setdefault("weixin", {}).update({
+                        "enabled": True,
+                        "token": token,
+                        "baseUrl": base or base_url,
+                    })
+                    with open(config_path, "w", encoding="utf-8") as f:
+                        _json.dump(cfg, f, indent=2, ensure_ascii=False)
+                return _http_json_response({"ok": True, "status": "confirmed", "has_token": bool(token)})
+            return _http_json_response({"ok": True, "status": status})
+        except Exception as e:
+            return _http_json_response({"ok": False, "status": "error", "error": str(e)})
+
+    def _weixin_connection_state(self) -> dict:
+        """Check WeChat connection state: connected/connecting/disconnected."""
+        import json as _json
+        config_path = Path.home() / ".nanobot" / "config.json"
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                cfg = _json.load(f)
+        except Exception:
+            return {"connected": False, "has_token": False, "enabled": False}
+        wx = cfg.get("channels", {}).get("weixin", {})
+        has_token = bool(wx.get("token"))
+        enabled = wx.get("enabled", False)
+        return {"connected": enabled and has_token, "has_token": has_token, "enabled": enabled}
+
+    def _handle_channels_list(self, request: WsRequest) -> Response:
+        """List available channels with their enabled status."""
+        import json as _json
+        config_path = Path.home() / ".nanobot" / "config.json"
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                cfg = _json.load(f)
+        except Exception:
+            cfg = {}
+        channels_cfg = cfg.get("channels", {})
+        result = []
+        for name in ["feishu", "weixin", "telegram", "discord", "slack", "whatsapp", "email"]:
+            ch = channels_cfg.get(name, {})
+            result.append({
+                "name": name,
+                "enabled": ch.get("enabled", False),
+            })
+        return _http_json_response({"channels": result})
+
+    def _handle_channels_config(self, request: WsRequest) -> Response:
+        """Return channel configurations for the web UI."""
+        import json as _json
+        config_path = Path.home() / ".nanobot" / "config.json"
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                cfg = _json.load(f)
+        except Exception:
+            cfg = {}
+        channels_cfg = cfg.get("channels", {})
+        result = {}
+        for name in ["feishu", "weixin", "telegram", "discord", "slack", "whatsapp", "email"]:
+            ch = channels_cfg.get(name, {})
+            if ch:
+                result[name] = {k: v for k, v in ch.items() if k != "token" and not k.endswith("Secret") and not k.endswith("Password")}
+                result[name]["enabled"] = ch.get("enabled", False)
+        return _http_json_response({"channels": result})
+
+    def _handle_channels_save_config(self, request: WsRequest) -> Response:
+        """Save IMA and Obsidian config to config.json via query params."""
+        if not self.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+
+        query = _parse_query(request.path)
+        ima_client_id = _query_first(query, "ima_client_id") or ""
+        ima_api_key = _query_first(query, "ima_api_key") or ""
+        ima_enabled = (_query_first(query, "ima_enabled") or "").lower() == "true"
+        obs_vault_path = _query_first(query, "obs_vault_path") or ""
+        obs_enabled = (_query_first(query, "obs_enabled") or "").lower() == "true"
+        feishu_enabled = (_query_first(query, "feishu_enabled") or "").lower() == "true"
+        feishu_app_id = _query_first(query, "feishu_app_id") or ""
+        feishu_app_secret = _query_first(query, "feishu_app_secret") or ""
+        feishu_encrypt_key = _query_first(query, "feishu_encrypt_key") or ""
+        feishu_verification_token = _query_first(query, "feishu_verification_token") or ""
+        weixin_enabled = (_query_first(query, "weixin_enabled") or "").lower() == "true"
+        weixin_token = _query_first(query, "weixin_token") or ""
+        weixin_base_url = _query_first(query, "weixin_base_url") or ""
+
+        config_path = Path.home() / ".nanobot" / "config.json"
+        if not config_path.exists():
+            return _http_error(500, "config.json not found")
+
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        except Exception as e:
+            return _http_error(500, f"failed to read config: {e}")
+
+        cfg.setdefault("tools", {}).setdefault("ima", {}).update({
+            "enabled": ima_enabled,
+            "clientId": ima_client_id or None,
+            "apiKey": ima_api_key or None,
+        })
+        cfg.setdefault("tools", {}).setdefault("obsidian", {}).update({
+            "enabled": obs_enabled,
+            "vaultPath": obs_vault_path or None,
+        })
+        # Feishu
+        channels = cfg.setdefault("channels", {})
+        channels["feishu"] = channels.get("feishu", {})
+        channels["feishu"].update({
+            "enabled": feishu_enabled,
+            "appId": feishu_app_id or "",
+            "appSecret": feishu_app_secret or "",
+            "encryptKey": feishu_encrypt_key or "",
+            "verificationToken": feishu_verification_token or "",
+        })
+        # WeChat
+        channels["weixin"] = channels.get("weixin", {})
+        channels["weixin"].update({
+            "enabled": weixin_enabled,
+            "token": weixin_token or "",
+            "baseUrl": weixin_base_url or "https://ilinkai.weixin.qq.com",
+        })
+
+        try:
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            return _http_error(500, f"failed to write config: {e}")
+
+        return _http_json_response({"ok": True, "message": "Config saved and applied immediately."})
+
+    def _handle_plugins_list(self, request: WsRequest) -> Response:
+        from nanobot.channels.registry import discover_all as discover_all_channels
+        from nanobot.agent.tools.loader import ToolLoader
+
+        channels = []
+        try:
+            all_channels = discover_all_channels()
+            for name, cls in all_channels.items():
+                channels.append({"name": name, "kind": "channel", "enabled": True})
+        except Exception:
+            pass
+
+        tools = []
+        try:
+            loader = ToolLoader()
+            registered = list(loader.discover().keys()) if hasattr(loader, "discover") else []
+            for name in sorted(registered):
+                tools.append({"name": name, "kind": "tool", "enabled": True})
+        except Exception:
+            pass
+
+        return _http_json_response({"plugins": channels + tools})
+
     # -- Static file serving ------------------------------------------------
 
     def _serve_static(self, request_path: str) -> Response | None:
@@ -837,7 +1503,13 @@ class GatewayHTTPHandler:
             self._log.warning("static: failed to read {}: {}", candidate, e)
             return _http_error(500, "Internal Server Error")
         ctype, _ = mimetypes.guess_type(candidate.name)
-        if ctype is None:
+        # Python's mimetypes on Windows returns text/plain for .js files,
+        # which browsers reject for ES module scripts. Override explicitly.
+        if candidate.name.endswith(".js"):
+            ctype = "application/javascript"
+        elif candidate.name.endswith(".css"):
+            ctype = "text/css"
+        elif ctype is None:
             ctype = "application/octet-stream"
         if ctype.startswith("text/") or ctype in {"application/javascript", "application/json"}:
             ctype = f"{ctype}; charset=utf-8"
