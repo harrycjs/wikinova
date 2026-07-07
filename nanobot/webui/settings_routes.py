@@ -17,7 +17,7 @@ from websockets.http11 import Response
 
 from nanobot.agent.tools.mcp import request_mcp_reload
 from nanobot.bus.queue import MessageBus
-from nanobot.config.loader import load_config
+from nanobot.config.loader import load_config, save_config
 from nanobot.optional_features import OptionalFeatureError
 from nanobot.webui.cli_apps_api import cli_apps_action, cli_apps_payload
 from nanobot.webui.http_utils import is_local_browser_request as _is_local_browser_request
@@ -95,6 +95,8 @@ class WebUISettingsRouter:
             return self._handle_settings_model_configuration_create(request)
         if path == "/api/settings/model-configurations/update":
             return self._handle_settings_model_configuration_update(request)
+        if path == "/api/settings/model-configurations/delete":
+            return self._handle_settings_model_configuration_delete(request)
         if path == "/api/settings/provider/update":
             return self._handle_settings_provider_update(request)
         if path == "/api/settings/provider-models":
@@ -244,6 +246,22 @@ class WebUISettingsRouter:
         except WebUISettingsError as e:
             return self._error_response(e.status, e.message)
         return self._json_response(self._with_restart_state(payload, section="image"))
+
+    def _handle_settings_model_configuration_delete(self, request: WsRequest) -> Response:
+        if not self._authorized(request):
+            return self._unauthorized()
+        try:
+            name = (_query_first(self._query(request), "name") or "").strip()
+            if not name or name == "default":
+                return self._error_response(400, "cannot delete default configuration")
+            config = load_config()
+            if name not in config.model_presets:
+                return self._error_response(404, "unknown model configuration")
+            del config.model_presets[name]
+            save_config(config)
+            return self._json_response({"name": name})
+        except WebUISettingsError as e:
+            return self._error_response(e.status, e.message)
 
     async def _handle_settings_provider_models(self, request: WsRequest) -> Response:
         if not self._authorized(request):
