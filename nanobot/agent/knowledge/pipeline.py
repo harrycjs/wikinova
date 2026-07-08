@@ -159,6 +159,15 @@ class IMAIngestPipeline:
             cursor = data.get("next_cursor") or ""
         return out
 
+    async def _list_knowledge_bases(self) -> list[dict[str, Any]]:
+        """List all the user's IMA knowledge bases."""
+        try:
+            data = await self.client.search_knowledge_base(query="", limit=50)
+        except IMAError as exc:
+            logger.warning("IMA search_knowledge_base failed: {}", exc)
+            return []
+        return data.get("info_list") or []
+
     async def _fetch_kb_items(self, kb_id: str, *, limit: int = 50) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
         cursor = ""
@@ -176,17 +185,36 @@ class IMAIngestPipeline:
         return out
 
     async def _fetch_note_content(self, note_id: str) -> str:
+        """Fetch content for a note or KB media item.
+
+        Tries ``get_doc_content`` first (works for notes and some KB items).
+        Falls back to ``get_media_info`` → URL fetch for KB media items.
+        """
+        # Attempt 1: get_doc_content (works for notes and note-type KB items)
         try:
             data = await self.client.get_doc_content(note_id=note_id, content_format=0)
+            for key in ("content", "doc_content", "text"):
+                if key in data and isinstance(data[key], str) and data[key].strip():
+                    return data[key]
         except IMAError as exc:
-            logger.warning("IMA get_doc_content failed for {}: {}", note_id, exc)
-            return ""
-        # The response shape varies; try common keys.
-        for key in ("content", "doc_content", "text"):
-            if key in data and isinstance(data[key], str):
-                return data[key]
-        # Fallback: stringify the whole payload (truncated).
-        return json.dumps(data, ensure_ascii=False)[:8000]
+            logger.debug("IMA get_doc_content failed for {}: {}", note_id, exc)
+
+        # Attempt 2: get_media_info → fetch URL (for KB media items)
+        try:
+            media_data = await self.client.get_media_info(media_id=note_id)
+            url_info = (media_data.get("data") or media_data).get("url_info") or {}
+            url = url_info.get("url") or ""
+            if url:
+                import httpx
+
+                resp = httpx.get(url, timeout=20, follow_redirects=True)
+                if resp.status_code == 200 and len(resp.text) > 50:
+                    text = re.sub(r"<[^>]+>", " ", resp.text)
+                    return re.sub(r"\s+", " ", text).strip()[:10_000]
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("IMA get_media_info / URL fetch failed for {}: {}", note_id, exc)
+
+        return ""
 
     # -- LLM summarization ----------------------------------------------
 
@@ -206,7 +234,7 @@ class IMAIngestPipeline:
             response = await self.provider.chat(
                 messages=[{"role": "user", "content": prompt}],
                 model=self.model,
-                settings=GenerationSettings(max_tokens=2500, temperature=0.2),
+                settings=GenerationSettings(max_tokens=10000, temperature=0.2),
                 tools=None,
             )
         except Exception as exc:  # noqa: BLE001
@@ -261,71 +289,6 @@ class IMAIngestPipeline:
                 fm[key.strip()] = value
         return fm
 
-    # -- main entry point ------------------------------------------------
-
-    async def run_once(self, *, max_items: int = 20) -> PipelineResult:
-        """Run one ingest pass.
-
-        Pulls the user's notes (skips already-seen ids via the cursor) and
-        summarizes each one into the Obsidian inbox. Knowledge-base items can
-        be added by passing ``kb_ids=[...]`` to :meth:`run_kb`.
-        """
-        started = datetime.now(timezone.utc).isoformat()
-        result = PipelineResult(started_at=started)
-
-        if not self.client.has_credentials():
-            result.errors.append("IMA credentials missing")
-            result.finished_at = datetime.now(timezone.utc).isoformat()
-            return result
-
-        cursor = self._read_cursor()
-        seen_ids: set[str] = set(cursor.get("notes") or [])
-
-        notes = await self._fetch_notes()
-        new_notes = [n for n in notes if (n.get("note_id") or n.get("id")) not in seen_ids]
-        new_notes = new_notes[:max_items]
-
-        sem = asyncio.Semaphore(self.max_concurrency)
-
-        async def process(note: dict[str, Any]) -> None:
-            note_id = note.get("note_id") or note.get("id") or ""
-            if not note_id:
-                result.items_skipped += 1
-                return
-            title = note.get("title") or note.get("note_title") or ""
-            async with sem:
-                body = await self._fetch_note_content(note_id)
-                if not body.strip():
-                    result.items_skipped += 1
-                    return
-                summary = await self._summarize(
-                    source_kind="note",
-                    source_id=note_id,
-                    source_url=note.get("url") or "",
-                    raw_content=body,
-                )
-                if not summary:
-                    result.items_skipped += 1
-                    return
-                written = self._write_summary_to_inbox(
-                    summary=summary,
-                    fallback_slug=self._safe_slug(title, fallback=f"ima-{note_id[:8]}"),
-                )
-                if written:
-                    result.notes_written.append(written)
-                    result.items_processed += 1
-                    seen_ids.add(note_id)
-                else:
-                    result.items_skipped += 1
-
-        await asyncio.gather(*(process(n) for n in new_notes), return_exceptions=True)
-        cursor["notes"] = sorted(seen_ids)
-        cursor["updated_at"] = datetime.now(timezone.utc).isoformat()
-        self._write_cursor(cursor)
-
-        result.finished_at = datetime.now(timezone.utc).isoformat()
-        return result
-
     def _write_summary_to_inbox(self, *, summary: str, fallback_slug: str) -> str | None:
         """Atomically write a summarized note into the Obsidian inbox.
 
@@ -356,3 +319,175 @@ class IMAIngestPipeline:
         rel = target.relative_to(self.inbox_root).as_posix()
         logger.info("Wrote IMA summary to {}", target)
         return rel
+
+    # -- main entry points -----------------------------------------------
+
+    async def run_once(self, *, max_items: int = 20) -> PipelineResult:
+        """Run one ingest pass for IMA notes.
+
+        Pulls the user's notes (skips already-seen ids via the cursor) and
+        summarizes each one into the Obsidian inbox.
+        """
+        started = datetime.now(timezone.utc).isoformat()
+        result = PipelineResult(started_at=started)
+
+        if not self.client.has_credentials():
+            result.errors.append("IMA credentials missing")
+            result.finished_at = datetime.now(timezone.utc).isoformat()
+            return result
+
+        cursor = self._read_cursor()
+        seen_ids: set[str] = set(cursor.get("notes") or [])
+
+        notes = await self._fetch_notes()
+        new_notes = [n for n in notes if (n.get("note_id") or n.get("id")) not in seen_ids]
+        new_notes = new_notes[:max_items]
+
+        sem = asyncio.Semaphore(self.max_concurrency)
+
+        async def process_note(note: dict[str, Any]) -> None:
+            note_id = note.get("note_id") or note.get("id") or ""
+            if not note_id:
+                result.items_skipped += 1
+                return
+            title = note.get("title") or note.get("note_title") or ""
+            async with sem:
+                body = await self._fetch_note_content(note_id)
+                if not body.strip():
+                    result.items_skipped += 1
+                    return
+                summary = await self._summarize(
+                    source_kind="note",
+                    source_id=note_id,
+                    source_url=note.get("url") or "",
+                    raw_content=body,
+                )
+                if not summary:
+                    result.items_skipped += 1
+                    return
+                written = self._write_summary_to_inbox(
+                    summary=summary,
+                    fallback_slug=self._safe_slug(title, fallback=f"ima-{note_id[:8]}"),
+                )
+                if written:
+                    result.notes_written.append(written)
+                    result.items_processed += 1
+                    seen_ids.add(note_id)
+                else:
+                    result.items_skipped += 1
+
+        await asyncio.gather(*(process_note(n) for n in new_notes), return_exceptions=True)
+        cursor["notes"] = sorted(seen_ids)
+        cursor["updated_at"] = datetime.now(timezone.utc).isoformat()
+        self._write_cursor(cursor)
+
+        result.finished_at = datetime.now(timezone.utc).isoformat()
+        return result
+
+    async def run_kb(self, *, max_items_per_kb: int = 20) -> PipelineResult:
+        """Run one ingest pass for all IMA knowledge-base items.
+
+        Discovers all KBs, fetches items from each, skips already-seen ids,
+        and summarizes new items into the Obsidian inbox.
+        """
+        started = datetime.now(timezone.utc).isoformat()
+        result = PipelineResult(started_at=started)
+
+        if not self.client.has_credentials():
+            result.errors.append("IMA credentials missing")
+            result.finished_at = datetime.now(timezone.utc).isoformat()
+            return result
+
+        cursor = self._read_cursor()
+        seen_ids: set[str] = set(cursor.get("kb_items") or [])
+
+        kbs = await self._list_knowledge_bases()
+        if not kbs:
+            result.errors.append("No knowledge bases found")
+            result.finished_at = datetime.now(timezone.utc).isoformat()
+            return result
+
+        sem = asyncio.Semaphore(self.max_concurrency)
+
+        async def process_kb_item(item: dict[str, Any], kb_name: str) -> None:
+            media_id = item.get("media_id") or item.get("id") or ""
+            if not media_id or media_id in seen_ids:
+                result.items_skipped += 1
+                return
+            title = item.get("title") or item.get("name") or "Untitled"
+            async with sem:
+                body = await self._fetch_note_content(media_id)
+                if not body.strip():
+                    result.items_skipped += 1
+                    return
+                source_url = ""
+                try:
+                    media_data = await self.client.get_media_info(media_id=media_id)
+                    url_info = (media_data.get("data") or media_data).get("url_info") or {}
+                    source_url = url_info.get("url") or ""
+                except Exception:  # noqa: BLE001
+                    pass
+                summary = await self._summarize(
+                    source_kind=f"kb:{kb_name}",
+                    source_id=media_id,
+                    source_url=source_url,
+                    raw_content=body,
+                )
+                if not summary:
+                    result.items_skipped += 1
+                    return
+                written = self._write_summary_to_inbox(
+                    summary=summary,
+                    fallback_slug=self._safe_slug(title, fallback=f"ima-{media_id[:8]}"),
+                )
+                if written:
+                    result.notes_written.append(written)
+                    result.items_processed += 1
+                    seen_ids.add(media_id)
+                else:
+                    result.items_skipped += 1
+
+        for kb in kbs:
+            kb_id = kb.get("kb_id") or ""
+            kb_name = kb.get("kb_name") or "unknown"
+            if not kb_id:
+                continue
+            items = await self._fetch_kb_items(kb_id)
+            new_items = [i for i in items if (i.get("media_id") or i.get("id")) not in seen_ids]
+            new_items = new_items[:max_items_per_kb]
+            await asyncio.gather(
+                *(process_kb_item(item, kb_name) for item in new_items),
+                return_exceptions=True,
+            )
+
+        cursor["kb_items"] = sorted(seen_ids)
+        cursor["updated_at"] = datetime.now(timezone.utc).isoformat()
+        self._write_cursor(cursor)
+
+        result.finished_at = datetime.now(timezone.utc).isoformat()
+        return result
+
+    async def run_all(self, *, max_notes: int = 20, max_items_per_kb: int = 20) -> PipelineResult:
+        """Run a full ingest pass: notes + all knowledge bases.
+
+        This is the single entry point used by both the cron job and manual
+        sync. It merges results from note and KB ingestion.
+        """
+        notes_result = await self.run_once(max_items=max_notes)
+        kb_result = await self.run_kb(max_items_per_kb=max_items_per_kb)
+
+        merged = PipelineResult(
+            items_processed=notes_result.items_processed + kb_result.items_processed,
+            items_skipped=notes_result.items_skipped + kb_result.items_skipped,
+            notes_written=notes_result.notes_written + kb_result.notes_written,
+            errors=notes_result.errors + kb_result.errors,
+            started_at=notes_result.started_at,
+            finished_at=kb_result.finished_at,
+        )
+        logger.info(
+            "IMA pipeline run_all: {} processed, {} skipped, {} written",
+            merged.items_processed,
+            merged.items_skipped,
+            len(merged.notes_written),
+        )
+        return merged

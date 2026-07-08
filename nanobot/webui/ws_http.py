@@ -753,7 +753,7 @@ class GatewayHTTPHandler:
         if got == "/api/ima/status":
             return self._handle_ima_status(request)
         if got == "/api/ima/sync":
-            return self._handle_ima_sync(request)
+            return await self._handle_ima_sync(request)
         if got == "/api/obsidian/status":
             return self._handle_obsidian_status(request)
         if got == "/api/obsidian/resync":
@@ -953,209 +953,89 @@ class GatewayHTTPHandler:
             "api_key": ima.get("apiKey"),
         })
 
-    def _handle_ima_sync(self, request: WsRequest) -> Response:
-        """Run IMA sync: fetch notes from IMA API, create wiki pages."""
+    async def _handle_ima_sync(self, request: WsRequest) -> Response:
+        """Run IMA sync: fetch notes + KB items, LLM summarize, write to Obsidian Inbox."""
         if not self.check_api_token(request):
             return _http_error(401, "Unauthorized")
 
-        import json as _json
         import traceback
-        import hashlib
 
-        config_path = Path.home() / ".nanobot" / "config.json"
+        logs: list[str] = []
         try:
-            with open(config_path, "r", encoding="utf-8") as f:
-                cfg = _json.load(f)
-        except Exception:
-            return _http_error(500, "cannot read config")
+            from nanobot.config.loader import load_config
+            from nanobot.providers.factory import make_provider
+            from nanobot.agent.tools.ima._client import IMAClient
+            from nanobot.agent.knowledge.pipeline import IMAIngestPipeline
 
-        ima_cfg = cfg.get("tools", {}).get("ima", {})
-        client_id = ima_cfg.get("clientId")
-        api_key = ima_cfg.get("apiKey")
-        if not client_id or not api_key:
-            return _http_json_response({
-                "ok": False,
-                "log": ["ERROR: IMA credentials not configured. Set Client ID and API Key first."],
-            })
+            # Load full Config object
+            try:
+                config = load_config()
+            except Exception as exc:
+                return _http_json_response({"ok": False, "log": [f"ERROR: cannot load config: {exc}"]})
 
-        logs = []
-        try:
-            import httpx as _httpx
+            # IMA credentials
+            ima_cfg = getattr(config.tools, "ima", None)
+            if not getattr(ima_cfg, "enabled", False):
+                return _http_json_response({"ok": False, "log": ["ERROR: IMA is not enabled in config."]})
+            if not ima_cfg.has_credentials():
+                return _http_json_response({"ok": False, "log": ["ERROR: IMA credentials not configured."]})
 
-            base_url = ima_cfg.get("baseUrl", "https://ima.qq.com")
-            headers = {
-                "ima-openapi-clientid": client_id,
-                "ima-openapi-apikey": api_key,
-                "Content-Type": "application/json",
-            }
-
-            # Step 1: List knowledge bases
-            logs.append("Fetching IMA knowledge bases...")
-            r = _httpx.post(
-                f"{base_url}/openapi/wiki/v1/search_knowledge_base",
-                json={"query": "", "cursor": "", "limit": 20},
-                headers=headers,
-                timeout=15,
+            # Build IMAClient
+            client = IMAClient.from_env_or_files(
+                client_id=ima_cfg.client_id,
+                api_key=ima_cfg.api_key,
+                base_url=ima_cfg.base_url,
             )
-            data = r.json()
-            if data.get("code") != 0:
-                logs.append(f"ERROR: IMA API error: {data.get('msg', 'unknown')}")
-                return _http_json_response({"ok": False, "log": logs})
 
-            kbs = data.get("data", {}).get("info_list") or []
-            logs.append(f"Found {len(kbs)} knowledge bases")
+            # Build LLM provider for summarization
+            model = (self.runtime_model_name() or "").strip()
+            if not model:
+                model = config.resolve_preset().model.strip()
+            if not model:
+                return _http_json_response({"ok": False, "log": ["ERROR: No model configured for summarization."]})
 
-            from nanobot.agent.wiki import WikiPaths, WikiStore
+            provider = make_provider(config, model=model)
 
-            workspace = Path.home() / ".nanobot" / "workspace"
-            paths = WikiPaths.from_workspace(workspace)
-            store = WikiStore(paths)
-            created = 0
-            skipped = 0
+            # Determine inbox path
+            obs_cfg = getattr(config.tools, "obsidian", None)
+            if getattr(obs_cfg, "enabled", False) and getattr(obs_cfg, "vault_path", None):
+                vault = Path(obs_cfg.vault_path).expanduser().resolve()
+            else:
+                vault = Path(config.workspace_path).expanduser().resolve()
+            vault_root = getattr(ima_cfg, "vault_root", "Nanobot") or "Nanobot"
+            inbox_subdir = getattr(ima_cfg, "inbox_subdir", "Inbox") or "Inbox"
+            inbox_root = vault / vault_root
 
-            for kb in kbs:
-                kb_id = kb.get("kb_id", "")
-                kb_name = kb.get("kb_name", "unknown")
-                logs.append(f"\nKB: {kb_name} ({kb.get('content_count', '?')} items)")
+            logs.append(f"IMA sync starting (model={model})")
 
-                try:
-                    kr = _httpx.post(
-                        f"{base_url}/openapi/wiki/v1/get_knowledge_list",
-                        json={"knowledge_base_id": kb_id, "cursor": "", "limit": 50},
-                        headers=headers,
-                        timeout=15,
-                    )
-                    kd = kr.json()
-                    if kd.get("code") != 0:
-                        logs.append(f"  ERROR: {kd.get('msg')}")
-                        continue
-                    items = kd.get("data", {}).get("list") or kd.get("data", {}).get("knowledge_list") or []
-                    logs.append(f"  Found {len(items)} items")
-                except Exception as e:
-                    logs.append(f"  ERROR: {e}")
-                    continue
+            # Run the unified pipeline
+            pipeline = IMAIngestPipeline(
+                client=client,
+                provider=provider,
+                model=model,
+                inbox_root=inbox_root,
+                workspace=Path(config.workspace_path),
+                inbox_dir_name=inbox_subdir,
+            )
 
-                for item in items[:10]:
-                    media_id = item.get("media_id") or item.get("id") or ""
-                    title = item.get("title") or item.get("name") or "Untitled"
-                    if not media_id:
-                        skipped += 1
-                        continue
+            result = await pipeline.run_all()
 
-                    content = ""
-                    source_url = ""
+            for path in result.notes_written:
+                logs.append(f"  OK: {path}")
+            if result.errors:
+                for err in result.errors:
+                    logs.append(f"  WARN: {err}")
 
-                    # Try get_doc_content first (for note-type items)
-                    try:
-                        nr = _httpx.post(
-                            f"{base_url}/openapi/note/v1/get_doc_content",
-                            json={"note_id": media_id, "target_content_format": 0},
-                            headers=headers,
-                            timeout=15,
-                        )
-                        nd = nr.json()
-                        if nd.get("code") == 0:
-                            nd_data = nd.get("data", {})
-                            content = nd_data.get("content") or nd_data.get("doc_content") or nd_data.get("text") or ""
-                    except Exception:
-                        pass
-
-                    # If no content, get URL from get_media_info and fetch it
-                    if not content:
-                        try:
-                            mr = _httpx.post(
-                                f"{base_url}/openapi/wiki/v1/get_media_info",
-                                json={"media_id": media_id},
-                                headers=headers,
-                                timeout=15,
-                            )
-                            md = mr.json()
-                            if md.get("code") == 0:
-                                md_data = md.get("data", {})
-                                url_info = md_data.get("url_info") or {}
-                                source_url = url_info.get("url") or ""
-                                if source_url:
-                                    logs.append(f"    Fetching URL: {source_url[:60]}...")
-                                    try:
-                                        # Try multiple extraction methods
-                                        content = ""
-
-                                        # Method 1: Jina Reader API with proper headers
-                                        try:
-                                            jina_url = f"https://r.jina.ai/{source_url}"
-                                            resp = _httpx.get(jina_url, timeout=30, follow_redirects=True, headers={
-                                                "Accept": "text/plain",
-                                                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                                            })
-                                            if resp.status_code == 200 and len(resp.text) > 100:
-                                                content = resp.text.strip()[:8000]
-                                        except Exception:
-                                            pass
-
-                                        # Method 2: Direct fetch with HTML extraction
-                                        if not content or "验证" in content[:100] or len(content) < 100:
-                                            try:
-                                                resp2 = _httpx.get(source_url, timeout=15, follow_redirects=True, headers={
-                                                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                                                })
-                                                if resp2.status_code == 200:
-                                                    raw_html = resp2.text
-                                                    # Try multiple extraction patterns
-                                                    for pattern in [
-                                                        r'<div[^>]*class="rich_media_content[^"]*"[^>]*>(.*?)</div>',
-                                                        r'<div[^>]*id="js_content"[^>]*>(.*?)</div>',
-                                                        r'<article[^>]*>(.*?)</article>',
-                                                    ]:
-                                                        body_match = re.search(pattern, raw_html, re.DOTALL)
-                                                        if body_match:
-                                                            content = re.sub(r"<[^>]+>", " ", body_match.group(1))
-                                                            content = re.sub(r"\s+", " ", content).strip()[:8000]
-                                                            break
-                                                    if not content:
-                                                        content = re.sub(r"<[^>]+>", " ", raw_html)
-                                                        content = re.sub(r"\s+", " ", content).strip()[:8000]
-                                            except Exception:
-                                                pass
-                                    except Exception as ue:
-                                        logs.append(f"    WARN: URL fetch failed: {ue}")
-                        except Exception:
-                            pass
-
-                    if not content.strip():
-                        # Store as reference with URL
-                        content = f"Source: {source_url}" if source_url else "(no content available)"
-                        logs.append(f"  INFO: {title[:40]} (URL reference only)")
-
-                    try:
-                        slug = re.sub(r"[^a-z0-9-]", "", title.lower().strip().replace(" ", "-"))
-                        if not slug:
-                            slug = f"ima-{hashlib.md5(title.encode()).hexdigest()[:8]}"
-                        slug = slug[:80]
-
-                        # Save to Obsidian vault
-                        obs_cfg = cfg.get("tools", {}).get("obsidian", {})
-                        vault_path = obs_cfg.get("vaultPath")
-                        if vault_path:
-                            vault = Path(vault_path).expanduser().resolve()
-                            obsidian_dir = vault / "Nanobot" / "Inbox"
-                            obsidian_dir.mkdir(parents=True, exist_ok=True)
-                            date_prefix = __import__("datetime").datetime.now().strftime("%Y-%m-%d")
-                            file_path = obsidian_dir / f"{date_prefix}-{slug}.md"
-                            file_content = f"---\ntitle: \"{title}\"\nsource: ima:{media_id}\ncaptured_at: {__import__('datetime').datetime.now().isoformat()}\n---\n\n{content[:8000]}"
-                            file_path.write_text(file_content, encoding="utf-8")
-                            logs.append(f"  OK: {title[:40]} → Obsidian/{file_path.name}")
-                            created += 1
-                        else:
-                            # No Obsidian configured, write directly to wiki
-                            store.write_page(slug=slug, title=title, body=content[:8000], tags=["ima", kb_name.lower()], source=f"ima:{media_id}")
-                            created += 1
-                            logs.append(f"  OK: {title[:40]} → wiki [{slug}]")
-                    except Exception as e:
-                        logs.append(f"  WARN: {title[:30]}: {e}")
-                        skipped += 1
-
-            logs.append(f"\nIMA sync complete: {created} created, {skipped} skipped")
-            return _http_json_response({"ok": True, "log": logs, "created": created, "skipped": skipped})
+            logs.append(
+                f"\nIMA sync complete: {result.items_processed} processed, "
+                f"{result.items_skipped} skipped, {len(result.notes_written)} written"
+            )
+            return _http_json_response({
+                "ok": True,
+                "log": logs,
+                "created": result.items_processed,
+                "skipped": result.items_skipped,
+            })
 
         except Exception as e:
             logs.append(f"FATAL: {traceback.format_exc()}")

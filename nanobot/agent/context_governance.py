@@ -78,13 +78,23 @@ class ContextGovernor:
         messages: list[dict[str, Any]],
         compacted_tool_call_ids: set[str],
     ) -> list[dict[str, Any]]:
+        # Level 1: Strip placeholder assistant messages
         updated = self.strip_placeholder_assistant_messages(messages)
+        # Level 2: Strip malformed tool calls
         updated = self.strip_malformed_tool_calls(updated)
+        # Level 3: Drop orphan tool results
         updated = self.drop_orphan_tool_results(updated)
+        # Level 4: Backfill missing tool results
         updated = self.backfill_missing_tool_results(updated)
+        # Level 5: Apply tool result budget (truncate oversized results)
         updated = self.apply_tool_result_budget(config, updated)
+        # Level 6: Microcompact — truncate old tool results to reduce noise
+        updated = self.microcompact(config, updated)
+        # Level 7: Compact in-flight overflow
         updated = self.compact_inflight_overflow(config, updated, compacted_tool_call_ids)
+        # Level 8: Snip history if still over budget
         updated = self.snip_history(config, updated)
+        # Level 9: Final orphan cleanup
         updated = self.drop_orphan_tool_results(updated)
         return self.backfill_missing_tool_results(updated)
 
@@ -315,6 +325,55 @@ class ContextGovernor:
                     updated = [dict(m) for m in messages]
                 updated[idx]["content"] = normalized
         return updated
+
+    def microcompact(
+        self,
+        config: ContextGovernanceConfig,
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Truncate old tool results to reduce context noise.
+
+        Keeps the most recent ``MICROCOMPACT_KEEP_RECENT`` tool results at
+        full length; older results exceeding ``MICROCOMPACT_MIN_CHARS`` are
+        truncated to save tokens.  This is a lighter pass than
+        ``compact_inflight_overflow`` — it does not require an LLM call and
+        acts deterministically.
+        """
+        if not config.context_window_tokens:
+            return messages
+
+        # Count tool results from the end
+        tool_indices = [
+            i for i, m in enumerate(messages) if m.get("role") == "tool"
+        ]
+        if len(tool_indices) <= MICROCOMPACT_KEEP_RECENT:
+            return messages
+
+        # Determine which tool results are candidates for truncation
+        cutoff = len(tool_indices) - MICROCOMPACT_KEEP_RECENT
+        candidate_ids = {tool_indices[i] for i in range(cutoff)}
+
+        updated: list[dict[str, Any]] | None = None
+        for idx, msg in enumerate(messages):
+            if idx not in candidate_ids:
+                if updated is not None:
+                    updated.append(msg)
+                continue
+
+            content = msg.get("content", "")
+            if not isinstance(content, str) or len(content) <= MICROCOMPACT_MIN_CHARS:
+                if updated is not None:
+                    updated.append(msg)
+                continue
+
+            if updated is None:
+                updated = [dict(m) for m in messages]
+
+            # Keep first 500 chars + truncation notice
+            truncated = content[:500] + f"\n... [truncated; {len(content)} chars total]"
+            updated[idx] = {**msg, "content": truncated}
+
+        return updated if updated is not None else messages
 
     def compact_inflight_overflow(
         self,

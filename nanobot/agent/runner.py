@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import os
 from contextlib import suppress
 from copy import deepcopy
@@ -57,6 +58,108 @@ from nanobot.utils.runtime import (
 )
 
 GoalContinueMessage = str | Callable[[], str | None]
+
+
+class _StreamingToolExecutor:
+    """Detect and execute complete tool calls during streaming.
+
+    As the LLM streams tool_call deltas, this executor accumulates
+    arguments JSON. When a complete tool call is detected (valid JSON
+    arguments), it is submitted for immediate execution — before the
+    stream finishes.  Concurrent-safe tools run in parallel.
+    """
+
+    def __init__(self, tools: ToolRegistry, concurrent: bool = True):
+        self._tools = tools
+        self._concurrent = concurrent
+        # id → {id, name, arguments_json}
+        self._pending: dict[str, dict[str, str]] = {}
+        # Completed results in order: (id, name, result)
+        self._results: list[tuple[str, str, Any]] = []
+        # Currently executing call ids
+        self._executing: set[str] = set()
+        self._lock = asyncio.Lock()
+
+    def on_tool_call_delta(self, delta: dict[str, Any]) -> None:
+        """Process an incremental tool_call delta from the streaming provider.
+
+        Each delta may contain: id, name, and/or arguments (incremental JSON).
+        When the accumulated arguments form valid JSON and we have a tool name,
+        the call is submitted for execution.
+        """
+        call_id = delta.get("id", "")
+        if not call_id:
+            return
+
+        if call_id not in self._pending:
+            self._pending[call_id] = {
+                "id": call_id,
+                "name": delta.get("name", ""),
+                "arguments_json": delta.get("arguments", ""),
+            }
+        else:
+            entry = self._pending[call_id]
+            args_delta = delta.get("arguments", "")
+            if args_delta:
+                entry["arguments_json"] += args_delta
+            if delta.get("name"):
+                entry["name"] = delta["name"]
+
+        # Check completeness: we need a name and parseable JSON arguments
+        entry = self._pending[call_id]
+        if entry["name"] and self._is_complete_json(entry["arguments_json"]):
+            self._submit(call_id, entry)
+
+    @staticmethod
+    def _is_complete_json(s: str) -> bool:
+        if not s:
+            return False
+        try:
+            obj = json.loads(s)
+            return isinstance(obj, dict)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            return False
+
+    def _submit(self, call_id: str, entry: dict[str, str]) -> None:
+        """Remove from pending and fire-and-forget an async execution task."""
+        del self._pending[call_id]
+        self._executing.add(call_id)
+        asyncio.ensure_future(self._execute_one(call_id, entry))
+
+    async def _execute_one(self, call_id: str, entry: dict[str, str]) -> None:
+        name = entry["name"]
+        try:
+            params = json.loads(entry["arguments_json"])
+            tool = self._tools.get(name)
+            if tool is None:
+                result = f"Unknown tool: {name}"
+            else:
+                result = await tool.execute(**params)
+        except Exception as exc:
+            result = f"Error executing {name}: {exc}"
+        async with self._lock:
+            self._results.append((call_id, name, result))
+        self._executing.discard(call_id)
+
+    async def wait_for_all(self) -> list[dict[str, Any]]:
+        """Block until all in-flight executions complete; return ordered results."""
+        while self._executing:
+            await asyncio.sleep(0.01)
+        return [
+            {"id": cid, "name": name, "result": result}
+            for cid, name, result in self._results
+        ]
+
+    def has_pending_or_executing(self) -> bool:
+        return bool(self._pending) or bool(self._executing)
+
+    def get_results(self) -> list[dict[str, Any]]:
+        """Return whatever results are available so far (non-blocking)."""
+        return [
+            {"id": cid, "name": name, "result": result}
+            for cid, name, result in self._results
+        ]
+
 
 _DEFAULT_ERROR_MESSAGE = "Sorry, I encountered an error calling the AI model."
 _ARREARAGE_ERROR_MESSAGE = (
@@ -456,12 +559,22 @@ class AgentRunner:
 
                 await hook.before_execute_tools(context)
 
-                results, new_events, fatal_error = await self._execute_tools(
-                    spec,
-                    response.tool_calls,
-                    external_lookup_counts,
-                    workspace_violation_counts,
-                )
+                # If the streaming executor pre-computed results during the
+                # stream, wait for all in-flight executions and reuse them.
+                # Otherwise fall back to the standard serial/parallel path.
+                if streaming_executor is not None and streaming_executor.has_pending_or_executing():
+                    pre_results = await streaming_executor.wait_for_all()
+                    results, new_events, fatal_error = self._collect_streaming_results(
+                        spec, response.tool_calls, pre_results,
+                        external_lookup_counts, workspace_violation_counts,
+                    )
+                else:
+                    results, new_events, fatal_error = await self._execute_tools(
+                        spec,
+                        response.tool_calls,
+                        external_lookup_counts,
+                        workspace_violation_counts,
+                    )
                 tool_events.extend(new_events)
                 tools_used.extend(
                     tool_call.name
@@ -767,6 +880,7 @@ class AgentRunner:
 
         progress_state: dict[str, bool] | None = None
         live_file_edits: StreamingFileEditTracker | None = None
+        streaming_executor: _StreamingToolExecutor | None = None
 
         if (
             spec.progress_callback is not None
@@ -781,9 +895,20 @@ class AgentRunner:
                 emit=_emit_live_file_edits,
             )
 
+        # When streaming is active, create a streaming tool executor that
+        # starts running tools as soon as they are fully detected in the
+        # stream — before the stream itself finishes.
+        if wants_streaming:
+            streaming_executor = _StreamingToolExecutor(
+                tools=spec.tools,
+                concurrent=spec.concurrent_tools,
+            )
+
         async def _tool_call_delta(delta: dict[str, Any]) -> None:
             if live_file_edits is not None:
                 await live_file_edits.update(delta)
+            if streaming_executor is not None:
+                streaming_executor.on_tool_call_delta(delta)
 
         if wants_streaming:
             thinking_buf = ""
@@ -1124,6 +1249,53 @@ class AgentRunner:
         for key, value in right.items():
             merged[key] = merged.get(key, 0) + value
         return merged
+
+    async def _collect_streaming_results(
+        self,
+        spec: AgentRunSpec,
+        tool_calls: list[ToolCallRequest],
+        pre_results: list[dict[str, Any]],
+        external_lookup_counts: dict[str, int],
+        workspace_violation_counts: dict[str, int],
+    ) -> tuple[list[Any], list[dict[str, str]], BaseException | None]:
+        """Reconcile pre-computed streaming results with the final tool_call list.
+
+        Tools that were already executed during streaming are reused.
+        Any remaining tools that were not pre-computed are executed normally.
+        """
+        # Build lookup from streaming results: id → (result, name)
+        result_by_id: dict[str, tuple[Any, str]] = {}
+        for entry in pre_results:
+            result_by_id[entry["id"]] = (entry["result"], entry["name"])
+
+        results: list[Any] = []
+        events: list[dict[str, str]] = []
+        fatal_error: BaseException | None = None
+        remaining: list[ToolCallRequest] = []
+
+        for tc in tool_calls:
+            if tc.id in result_by_id:
+                result, _ = result_by_id[tc.id]
+                # Build event (mirror _run_tool's shape)
+                event: dict[str, str] = {"tool": tc.name, "status": "ok"}
+                if is_tool_error_result(result):
+                    event["status"] = "error"
+                results.append(result)
+                events.append(event)
+            else:
+                remaining.append(tc)
+
+        # Execute any tools that were not pre-computed during streaming
+        if remaining:
+            rem_results, rem_events, rem_error = await self._execute_tools(
+                spec, remaining, external_lookup_counts, workspace_violation_counts,
+            )
+            results.extend(rem_results)
+            events.extend(rem_events)
+            if rem_error is not None and fatal_error is None:
+                fatal_error = rem_error
+
+        return results, events, fatal_error
 
     async def _execute_tools(
         self,
