@@ -171,10 +171,10 @@ class IMAClient:
 
     # -- notes helpers --------------------------------------------------
 
-    async def list_notebook(self, *, cursor: str = "0", limit: int = 50) -> dict[str, Any]:
+    async def list_notebook(self, *, cursor: str = "0", limit: int = 20) -> dict[str, Any]:
         return await self._request(
             "openapi/note/v1/list_notebook",
-            {"cursor": cursor, "limit": min(max(limit, 1), 100)},
+            {"cursor": cursor, "limit": min(max(limit, 1), 20)},
         )
 
     async def list_note(
@@ -182,9 +182,9 @@ class IMAClient:
         *,
         folder_id: str | None = None,
         cursor: str = "",
-        limit: int = 50,
+        limit: int = 20,
     ) -> dict[str, Any]:
-        body: dict[str, Any] = {"cursor": cursor, "limit": min(max(limit, 1), 100)}
+        body: dict[str, Any] = {"cursor": cursor, "limit": min(max(limit, 1), 20)}
         if folder_id:
             body["folder_id"] = folder_id
         return await self._request("openapi/note/v1/list_note", body)

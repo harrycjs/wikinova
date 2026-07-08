@@ -33,6 +33,12 @@ class WikiConfig(Base):
     max_page_chars: int = Field(default=32_000, ge=1000)
     search_top_k: int = Field(default=5, ge=1, le=50)
     evolution: WikiEvolutionConfig = Field(default_factory=WikiEvolutionConfig)
+    # Importers enabled for the ``POST /api/wiki/import`` endpoint. Empty list
+    # disables the endpoint entirely. Order is irrelevant — each importer is
+    # keyed by source type and dispatched on demand.
+    importers: list[str] = Field(
+        default_factory=lambda: ["markdown", "text", "pdf", "url"],
+    )
 
 
 class IMAToolsConfig(Base):

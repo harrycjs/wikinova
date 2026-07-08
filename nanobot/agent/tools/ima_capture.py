@@ -35,9 +35,10 @@ def _build_client_from_ctx(ctx) -> IMAClient:
     root = getattr(ctx, "config", ctx)
     tools = getattr(root, "tools", None)
     ima_cfg = getattr(tools, "ima", None) if tools is not None else getattr(root, "ima", None)
-    client_id = getattr(ima_cfg, "client_id", None)
-    api_key = getattr(ima_cfg, "api_key", None)
-    base_url = getattr(ima_cfg, "base_url", None) or IMAClient().base_url
+    # Support both camelCase (from config.json) and snake_case
+    client_id = getattr(ima_cfg, "client_id", None) or getattr(ima_cfg, "clientId", None)
+    api_key = getattr(ima_cfg, "api_key", None) or getattr(ima_cfg, "apiKey", None)
+    base_url = getattr(ima_cfg, "base_url", None) or getattr(ima_cfg, "baseUrl", None) or IMAClient().base_url
     timeout_s = float(getattr(ima_cfg, "timeout_s", 30.0))
     return IMAClient.from_env_or_files(
         client_id=client_id,

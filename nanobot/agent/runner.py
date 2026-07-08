@@ -515,7 +515,7 @@ class AgentRunner:
                 session_key=spec.session_key,
             )
             await hook.before_iteration(context)
-            response = await self._request_model(spec, messages_for_model, hook, context)
+            response, streaming_executor = await self._request_model(spec, messages_for_model, hook, context)
             context.response = response
             context.tool_calls = list(response.tool_calls)
 
@@ -1035,8 +1035,8 @@ class AgentRunner:
             fallback_messages = self._malformed_tool_call_retry_messages(
                 messages, response.content,
             )
-            return await self._request_no_tools(spec, fallback_messages)
-        return response
+            return await self._request_no_tools(spec, fallback_messages), None
+        return response, streaming_executor
 
     @staticmethod
     def _drop_malformed_tool_calls(

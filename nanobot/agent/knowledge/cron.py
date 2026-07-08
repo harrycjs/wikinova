@@ -8,8 +8,6 @@ vault to regenerate wiki pages.
 
 from __future__ import annotations
 
-import re as _re
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -27,7 +25,7 @@ async def run_knowledge_sync(config: Any, agent: Any) -> None:
 
     # ── Step 2: Obsidian → Wiki sync ──────────────────────────────────────
     if getattr(obs_cfg, "enabled", False) and getattr(obs_cfg, "vault_path", None):
-        await _sync_obsidian_to_wiki(config, obs_cfg)
+        await _sync_obsidian_to_wiki(config, obs_cfg, agent)
 
     logger.info("knowledge_sync: completed")
 
@@ -38,10 +36,15 @@ async def _sync_ima(config: Any, ima_cfg: Any, obs_cfg: Any, agent: Any) -> None
         from nanobot.agent.knowledge.pipeline import IMAIngestPipeline
         from nanobot.agent.tools.ima._client import IMAClient
 
+        # Support both camelCase (from config.json) and snake_case
+        client_id = getattr(ima_cfg, "client_id", None) or getattr(ima_cfg, "clientId", None)
+        api_key = getattr(ima_cfg, "api_key", None) or getattr(ima_cfg, "apiKey", None)
+        base_url = getattr(ima_cfg, "base_url", None) or getattr(ima_cfg, "baseUrl", "https://ima.qq.com")
+
         client = IMAClient.from_env_or_files(
-            client_id=getattr(ima_cfg, "client_id", None),
-            api_key=getattr(ima_cfg, "api_key", None),
-            base_url=getattr(ima_cfg, "base_url", "https://ima.qq.com"),
+            client_id=client_id,
+            api_key=api_key,
+            base_url=base_url,
         )
         if not client.has_credentials():
             logger.warning("knowledge_sync: IMA credentials missing, skipping")
@@ -77,53 +80,42 @@ async def _sync_ima(config: Any, ima_cfg: Any, obs_cfg: Any, agent: Any) -> None
         logger.warning("knowledge_sync: IMA sync failed: {}", exc)
 
 
-async def _sync_obsidian_to_wiki(config: Any, obs_cfg: Any) -> None:
-    """Scan Obsidian vault → create wiki pages."""
+async def _sync_obsidian_to_wiki(config: Any, obs_cfg: Any, agent: Any = None) -> None:
+    """Scan Obsidian vault → create wiki pages via :class:`ObsidianWikiSync`.
+
+    Uses the canonical sync class (with sha256 diffing and incremental state
+    persistence) rather than reimplementing the walk inline. The vault is the
+    source of truth; the wiki is just a cache, so we never overwrite existing
+    pages whose body hasn't changed.
+    """
     try:
+        from nanobot.agent.wiki import WikiPaths, WikiStore
+        from nanobot.agent.wiki.sync import ObsidianWikiSync
+
         vault_path = Path(obs_cfg.vault_path).expanduser().resolve()
         if not vault_path.exists():
             logger.warning("knowledge_sync: Obsidian vault not found: {}", vault_path)
             return
 
-        from nanobot.agent.wiki import WikiPaths, WikiStore
-        from nanobot.agent.wiki.frontmatter import parse_frontmatter
-
-        import hashlib
-
         workspace = config.workspace_path
         paths = WikiPaths.from_workspace(Path(workspace))
         store = WikiStore(paths)
-        md_files = sorted(vault_path.rglob("*.md"))
-        created = 0
-        for md_file in md_files[:30]:
-            try:
-                content = md_file.read_text(encoding="utf-8", errors="replace")
-            except Exception:
-                continue
-            if not content.strip():
-                continue
-
-            fm, body = parse_frontmatter(content)
-            title = fm.title or md_file.stem
-            stem = md_file.stem
-            slug = _re.sub(r"^\d{4}-\d{2}-\d{2}-", "", stem).lower().replace(" ", "-")
-            slug = _re.sub(r"[^a-z0-9-]", "", slug).strip("-")
-            if not slug or len(slug) < 3:
-                slug = f"vault-{hashlib.md5(md_file.name.encode()).hexdigest()[:8]}"
-            slug = slug[:80]
-
-            body_content = body if body else content
-            try:
-                store.write_page(
-                    slug=slug,
-                    title=title,
-                    body=body_content[:8000],
-                    tags=["obsidian", "vault"],
-                    source=f"obsidian:{md_file.relative_to(vault_path).as_posix()}",
-                )
-                created += 1
-            except Exception:
-                pass
-        logger.info("knowledge_sync: Obsidian synced {} pages to wiki", created)
+        vault_root = getattr(obs_cfg, "nanobot_root", None) or ""
+        sync = ObsidianWikiSync(
+            store,
+            vault_path=vault_path,
+            vault_root=vault_root,
+        )
+        result = await sync.run_once(agent=agent, max_files=50)
+        logger.info(
+            "knowledge_sync: Obsidian sync — scanned={}, changed={}, generated={}, skipped={}",
+            result.scanned,
+            len(result.changed),
+            len(result.generated),
+            len(result.skipped),
+        )
+        if result.errors:
+            for err in result.errors:
+                logger.warning("knowledge_sync: Obsidian sync error: {}", err)
     except Exception as exc:
         logger.warning("knowledge_sync: Obsidian sync failed: {}", exc)

@@ -18,49 +18,10 @@ if TYPE_CHECKING:
     from nanobot.agent.loop import AgentLoop
 
 
-GENERATE_FROM_VAULT_PROMPT = """\
-You are the wiki generator for a personal knowledge base. The user has just
-added or modified the following note in their Obsidian vault:
-
-Path: {vault_path}
-Title: {title}
-
---- BEGIN NOTE ---
-{note_body}
---- END NOTE ---
-
-Your job is to turn this note into one or more interconnected wiki pages under
-`workspace/wiki/pages/`. Each page must:
-
-1. Have a slug matching `[a-z][a-z0-9-]{{0,95}}` derived from the note's main
-   concept (lowercase, dashes for spaces).
-2. Start with a YAML frontmatter block (use the `write_file` tool with the
-   frontmatter rendered as the first lines of the file):
-   - `title`: human-readable title
-   - `slug`: the page slug
-   - `tags`: 2–6 lowercase tags
-   - `links`: slugs of related wiki pages (use `[[wikilink]]` syntax in the body)
-   - `created` / `updated`: ISO 8601 timestamps
-   - `source`: `obsidian:{vault_path}`
-3. Body in markdown, with `[[other-slug]]` wikilinks to other wiki pages
-   whenever a related concept is mentioned. New pages referenced in wikilinks
-   do not need to be created now — they will be generated in future runs.
-4. Cross-link to at least 2 existing wiki pages if any exist. Run
-   `list_wiki_pages` first to see what's there.
-
-Hard rules:
-- Do NOT modify any file under `<vault>` — that is the user's primary notes.
-- Do NOT modify any wiki page other than the ones you are creating.
-- Do NOT use shell, exec, web_fetch, or any non-wiki tool.
-- If the note is empty or trivial, do nothing — return without writing.
-- Keep each page under 8 KB of body content.
-
-Available tools (in addition to the wiki tools above):
-- `list_wiki_pages` — see existing pages
-- `read_wiki_page(slug)` — read an existing page for context
-- `write_wiki_page(slug, title, body, tags, links)` — create a page
-- `update_wiki_page(slug, old_text, new_text)` — surgical edit
-"""
+# Load the ingest prompt template
+_INGEST_PROMPT_PATH = Path(__file__).parent / "prompts" / "ingest_source.md"
+INDEX_PROMPT_PATH = Path(__file__).parent / "prompts" / "generate_index.md"
+LINT_PROMPT_PATH = Path(__file__).parent / "prompts" / "lint_wiki.md"
 
 
 @dataclass
@@ -78,7 +39,7 @@ class WikiGenerator:
     def __init__(self, store: WikiStore):
         self.store = store
 
-    async def generate_from_vault_file(
+    async def ingest_source(
         self,
         agent: "AgentLoop",
         vault_path: Path,
@@ -87,19 +48,35 @@ class WikiGenerator:
         title: str | None = None,
         session_key: str | None = None,
     ) -> GenerationResult:
-        """One-shot generation pass for a single vault file."""
+        """Ingest a source note and generate multiple Wiki pages.
+
+        This is the core of the Karpathy-style wiki generation:
+        one source → multiple interconnected Wiki pages.
+        """
         from datetime import datetime, timezone
 
         title = title or vault_path.stem
-        prompt = GENERATE_FROM_VAULT_PROMPT.format(
-            vault_path=str(vault_path),
-            title=title,
-            note_body=note_body,
-        )
-        before = {p["slug"] for p in self.store.list_pages()}
-        session_key = session_key or f"wiki-gen:{datetime.now(timezone.utc).isoformat()}"
 
-        # Snapshot pages before so we can diff after.
+        # Load the ingest prompt template
+        try:
+            prompt_template = _INGEST_PROMPT_PATH.read_text(encoding="utf-8")
+        except OSError:
+            # Fallback to inline prompt if file not found
+            prompt_template = self._get_fallback_ingest_prompt()
+
+        # Use str.replace() instead of .format() to avoid issues with
+        # curly braces in the prompt template (e.g. {核心概念} in examples).
+        prompt = (
+            prompt_template
+            .replace("{vault_path}", str(vault_path))
+            .replace("{title}", title)
+            .replace("{note_body}", note_body)
+        )
+
+        before = {p["slug"] for p in self.store.list_pages()}
+        session_key = session_key or f"wiki-ingest:{datetime.now(timezone.utc).isoformat()}"
+
+        # Run the LLM to generate multiple Wiki pages
         await agent.process_direct(
             prompt,
             session_key=session_key,
@@ -107,13 +84,113 @@ class WikiGenerator:
             tools=self._build_generator_tools(),
             persist_user_message=False,
         )
+
         after = {p["slug"] for p in self.store.list_pages()}
         new_pages = sorted(after - before)
-        # "updated" detection would require per-page mtime diff — for v1 we
-        # only report new pages; updates show up as new pages with the same slug.
+
         if not new_pages:
             return GenerationResult(pages_written=[], pages_updated=[], skipped_reason="no-change")
+
+        # Update index.md after generating pages
+        await self._update_index(agent, session_key=f"{session_key}:index")
+
         return GenerationResult(pages_written=new_pages, pages_updated=[])
+
+    async def _update_index(self, agent: "AgentLoop", session_key: str) -> None:
+        """Update the index.md file with all current pages."""
+        try:
+            prompt_template = INDEX_PROMPT_PATH.read_text(encoding="utf-8")
+        except OSError:
+            return
+
+        # Get all pages for the index
+        pages = self.store.list_pages()
+        pages_list = "\n".join([
+            f"- {p.get('title', 'Untitled')} ({p.get('slug', 'unknown')}) - {p.get('tags', [])}"
+            for p in pages
+        ])
+
+        from datetime import datetime, timezone
+        prompt = (
+            prompt_template
+            .replace("{pages_list}", pages_list)
+            .replace("{timestamp}", datetime.now(timezone.utc).isoformat())
+        )
+
+        await agent.process_direct(
+            prompt,
+            session_key=session_key,
+            ephemeral=True,
+            tools=self._build_generator_tools(),
+            persist_user_message=False,
+        )
+
+    async def lint_wiki(self, agent: "AgentLoop", session_key: str | None = None) -> dict[str, Any]:
+        """Run a lint check on the Wiki to find and fix issues."""
+        from datetime import datetime, timezone
+
+        try:
+            prompt_template = LINT_PROMPT_PATH.read_text(encoding="utf-8")
+        except OSError:
+            return {"error": "lint prompt not found"}
+
+        # Get all pages content
+        pages = self.store.list_pages()
+        pages_content = []
+        for p in pages[:20]:  # Limit to 20 pages for context
+            slug = p.get("slug", "")
+            if slug:
+                page_data = self.store.read_page(slug)
+                if page_data:
+                    pages_content.append(f"## {page_data.title}\n{page_data.body[:2000]}")
+
+        prompt = prompt_template.replace(
+            "{pages_content}", "\n\n".join(pages_content),
+        )
+
+        session_key = session_key or f"wiki-lint:{datetime.now(timezone.utc).isoformat()}"
+
+        await agent.process_direct(
+            prompt,
+            session_key=session_key,
+            ephemeral=True,
+            tools=self._build_generator_tools(),
+            persist_user_message=False,
+        )
+
+        return {"status": "completed", "pages_checked": len(pages)}
+
+    def _get_fallback_ingest_prompt(self) -> str:
+        """Fallback prompt if the template file is not found."""
+        return """\
+You are the wiki generator for a personal knowledge base. The user has just
+added or modified the following note in their Obsidian vault:
+
+Path: {vault_path}
+Title: {title}
+
+--- BEGIN NOTE ---
+{note_body}
+--- END NOTE ---
+
+Your job is to turn this note into multiple interconnected Wiki pages.
+
+Generate 3-8 pages including:
+1. A main topic page (required)
+2. Concept pages for key terms
+3. Comparison pages if applicable
+4. Entity pages for people/companies
+
+Each page must have YAML frontmatter with: title, slug, tags, type, source, created, updated, related.
+
+Use [[slug]] syntax to link between pages. Do NOT just copy the original note - extract, reorganize, and build connections.
+
+Available tools:
+- `list_wiki_pages` — see existing pages
+- `read_wiki_page(slug)` — read an existing page
+- `write_wiki_page(slug, title, body, tags, links, source)` — create a page
+
+Start generating:"""
 
     def _build_generator_tools(self) -> Any:
         """Build the restricted wiki-tool registry for generator turns.

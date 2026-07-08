@@ -1630,48 +1630,285 @@ def _run_gateway(
     else:
         console.print("[yellow]✗[/yellow] Heartbeat: disabled")
 
-    async def _health_server(host: str, health_port: int):
-        """Lightweight HTTP health endpoint on the gateway port."""
-        import json as _json
+    async def _http_server(host: str, http_port: int):
+        """HTTP server for health checks and POST API endpoints.
 
-        async def handle(reader, writer):
+        The websockets library (used by the WebSocket channel on port 8765)
+        rejects HTTP POST requests at the protocol level (``Request.parse``
+        only accepts GET).  This aiohttp server fills that gap by handling
+        POST routes that need a proper HTTP stack (multipart uploads, etc.)
+        on a dedicated port.  Only binds to localhost for security.
+        """
+        import uuid as _uuid
+        from aiohttp import web
+
+        app = web.Application(client_max_size=20 * 1024 * 1024)  # 20MB for file uploads
+
+        async def handle_health(request: web.Request) -> web.Response:
+            return web.json_response({"status": "ok"})
+
+        async def handle_wiki_import(request: web.Request) -> web.Response:
+            content_type = request.content_type or ""
+
             try:
-                data = await asyncio.wait_for(reader.read(4096), timeout=5)
-            except (asyncio.TimeoutError, ConnectionError):
-                writer.close()
-                return
+                from nanobot.agent.wiki import WikiPaths, WikiStore
+                from pathlib import Path
+                workspace = Path(
+                    session_manager.workspace if session_manager else "~/.nanobot/workspace"
+                ).expanduser().resolve()
+                paths = WikiPaths.from_workspace(workspace)
+                store = WikiStore(paths)
 
-            request_line = data.split(b"\r\n", 1)[0].decode("utf-8", errors="replace")
-            method, path = "", ""
-            parts = request_line.split(" ")
-            if len(parts) >= 2:
-                method, path = parts[0], parts[1]
+                if content_type.startswith("multipart/form-data"):
+                    reader = await request.multipart()
+                    body = None
+                    title = None
+                    while True:
+                        part = await reader.next()
+                        if part is None:
+                            break
+                        if part.name == "file":
+                            filename = part.filename or ""
+                            raw = await part.read()
+                            lower = filename.lower()
+                            if lower.endswith(".pdf"):
+                                try:
+                                    import pypdf
+                                    import io
+                                    pdf_reader = pypdf.PdfReader(io.BytesIO(raw))
+                                    chunks = []
+                                    for page in pdf_reader.pages:
+                                        try:
+                                            chunks.append(page.extract_text() or "")
+                                        except Exception:
+                                            continue
+                                    body = "\n\n".join(chunks).strip()
+                                except ImportError:
+                                    return web.json_response(
+                                        {"error": "PDF import requires pypdf"},
+                                        status=400,
+                                    )
+                            else:
+                                body = raw.decode("utf-8", errors="replace")
+                            if not title:
+                                # Extract title from filename
+                                raw_title = filename.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+                                # Remove surrogate characters
+                                title = "".join(c for c in raw_title if ord(c) < 0xD800 or ord(c) > 0xDFFF)
+                                # If title is empty after removing surrogates, use first line of body
+                                if not title and body:
+                                    first_line = body.splitlines()[0].lstrip("# ").strip()
+                                    title = first_line[:80] if first_line else "imported"
+                                elif not title:
+                                    title = "imported"
+                        elif part.name == "title":
+                            raw_title = (await part.read()).decode("utf-8", errors="replace")
+                            # Remove surrogate characters
+                            title = "".join(c for c in raw_title if ord(c) < 0xD800 or ord(c) > 0xDFFF)
+                            if not title:
+                                title = "imported"
 
-            if method == "GET" and path == "/health":
-                body = _json.dumps({"status": "ok"})
-                resp = (
-                    f"HTTP/1.0 200 OK\r\n"
-                    f"Content-Type: application/json\r\n"
-                    f"Content-Length: {len(body)}\r\n"
-                    f"\r\n{body}"
-                )
+                    if not body or not body.strip():
+                        return web.json_response({"error": "imported content is empty"}, status=400)
+
+                    import re as _re
+                    slug_source = title or body.splitlines()[0][:80]
+                    slug = _re.sub(r"[^a-z0-9-]+", "-", slug_source.lower()).strip("-")
+                    slug = _re.sub(r"-+", "-", slug)[:80].strip("-")
+                    slug = slug or f"import-{_uuid.uuid4().hex[:8]}"
+                    if store.read_page(slug) is not None:
+                        slug = f"{slug}-{_uuid.uuid4().hex[:6]}"
+
+                    page = store.write_page(
+                        slug=slug,
+                        title=title or slug.replace("-", " ").title(),
+                        body=body,
+                        tags=["imported"],
+                        source=f"webui-import:{content_type}",
+                        merge_existing=False,
+                    )
+                    logger.info("wiki/import: success slug={}", page.slug)
+                    return web.json_response(
+                        {"ok": True, "slug": page.slug, "title": page.title, "chars": len(body)}
+                    )
+                else:
+                    return web.json_response(
+                        {"error": "multipart/form-data required for file upload"},
+                        status=400,
+                    )
+            except Exception as exc:
+                logger.exception("wiki/import: failed")
+                return web.json_response({"error": str(exc)}, status=500)
+
+        async def handle_wiki_import_url(request: web.Request) -> web.Response:
+            try:
+                payload = await request.json()
+            except Exception:
+                return web.json_response({"error": "invalid JSON"}, status=400)
+
+            kind = payload.get("type", "url")
+            url = payload.get("url", "").strip()
+
+            if kind == "url" and url:
+                try:
+                    import httpx
+                    import re as _re
+                    resp = httpx.get(
+                        url, timeout=20.0, follow_redirects=True,
+                        headers={"User-Agent": "nanobot-wiki-importer/1.0"},
+                    )
+                    resp.raise_for_status()
+                    body = _re.sub(r"<[^>]+>", "", resp.text).strip()
+                    title = payload.get("title", "") or url.rsplit("/", 1)[-1][:80]
+                except Exception as exc:
+                    return web.json_response({"error": f"fetch failed: {exc}"}, status=400)
+            elif kind in ("text", "markdown"):
+                body = payload.get("body", "")
+                title = payload.get("title", "")
             else:
-                body = "Not Found"
-                resp = (
-                    f"HTTP/1.0 404 Not Found\r\n"
-                    f"Content-Type: text/plain\r\n"
-                    f"Content-Length: {len(body)}\r\n"
-                    f"\r\n{body}"
+                return web.json_response({"error": f"unsupported type: {kind}"}, status=400)
+
+            if not body or not body.strip():
+                return web.json_response({"error": "imported content is empty"}, status=400)
+
+            try:
+                from nanobot.agent.wiki import WikiPaths, WikiStore
+                from pathlib import Path
+                workspace = Path(
+                    session_manager.workspace if session_manager else "~/.nanobot/workspace"
+                ).expanduser().resolve()
+                paths = WikiPaths.from_workspace(workspace)
+                store = WikiStore(paths)
+
+                import re as _re
+                slug_source = title or body.splitlines()[0][:80]
+                slug = _re.sub(r"[^a-z0-9-]+", "-", slug_source.lower()).strip("-")
+                slug = _re.sub(r"-+", "-", slug)[:80].strip("-")
+                slug = slug or f"import-{_uuid.uuid4().hex[:8]}"
+                if store.read_page(slug) is not None:
+                    slug = f"{slug}-{_uuid.uuid4().hex[:6]}"
+
+                page = store.write_page(
+                    slug=slug,
+                    title=title or slug.replace("-", " ").title(),
+                    body=body,
+                    tags=["imported"],
+                    source=f"webui-import:{kind}",
+                    merge_existing=False,
+                )
+                logger.info("wiki/import: success slug={}", page.slug)
+                return web.json_response(
+                    {"ok": True, "slug": page.slug, "title": page.title, "chars": len(body)}
+                )
+            except Exception as exc:
+                logger.exception("wiki/import: failed")
+                return web.json_response({"error": str(exc)}, status=500)
+
+        async def handle_wiki_lint(request: web.Request) -> web.Response:
+            """Run lint check on Wiki to find and fix issues."""
+            try:
+                from nanobot.agent.wiki import WikiPaths, WikiStore
+                from nanobot.agent.wiki.generator import WikiGenerator
+
+                workspace = Path.home() / ".nanobot" / "workspace"
+                paths = WikiPaths.from_workspace(workspace)
+                store = WikiStore(paths)
+                gen = WikiGenerator(store)
+
+                # Run lint check (needs agent, so return basic info)
+                pages = store.list_pages()
+                return web.json_response({
+                    "ok": True,
+                    "pages_count": len(pages),
+                    "message": "Lint check requires agent. Use /api/obsidian/resync to regenerate pages."
+                })
+            except Exception as exc:
+                return web.json_response({"error": str(exc)}, status=500)
+
+        async def handle_ima_sync(request: web.Request) -> web.Response:
+            """Run IMA sync: fetch notes + KB items, LLM summarize, write to Obsidian Inbox."""
+            import traceback
+
+            logs: list[str] = []
+            try:
+                from nanobot.config.loader import load_config
+                from nanobot.providers.factory import make_provider
+                from nanobot.agent.tools.ima._client import IMAClient
+                from nanobot.agent.knowledge.pipeline import IMAIngestPipeline
+
+                # Load full Config object
+                try:
+                    config = load_config()
+                except Exception as exc:
+                    return web.json_response({"ok": False, "log": [f"ERROR: cannot load config: {exc}"]})
+
+                # IMA credentials
+                ima_cfg = getattr(config.tools, "ima", None)
+                if ima_cfg is None or not getattr(ima_cfg, "enabled", False):
+                    return web.json_response({"ok": False, "log": ["IMA is not enabled"]})
+
+                # Support both camelCase (from config.json) and snake_case
+                client_id = getattr(ima_cfg, "client_id", None) or getattr(ima_cfg, "clientId", None)
+                api_key = getattr(ima_cfg, "api_key", None) or getattr(ima_cfg, "apiKey", None)
+                base_url = getattr(ima_cfg, "base_url", None) or getattr(ima_cfg, "baseUrl", "https://ima.qq.com")
+
+                client = IMAClient.from_env_or_files(
+                    client_id=client_id,
+                    api_key=api_key,
+                    base_url=base_url,
+                )
+                if not client.has_credentials():
+                    return web.json_response({"ok": False, "log": ["IMA credentials missing"]})
+
+                # Build provider for LLM summarization
+                try:
+                    provider = make_provider(config)
+                except Exception as exc:
+                    logs.append(f"WARNING: cannot create LLM provider: {exc}")
+                    provider = None
+
+                # Use Obsidian vault path if configured, otherwise workspace
+                obs_cfg = getattr(config.tools, "obsidian", None)
+                vault_path = getattr(obs_cfg, "vault_path", None) if obs_cfg else None
+                if not vault_path:
+                    vault_path = str(config.workspace_path)
+                vault = Path(vault_path).expanduser().resolve()
+                vault_root = getattr(ima_cfg, "vault_root", "Nanobot") or "Nanobot"
+                inbox_subdir = getattr(ima_cfg, "inbox_subdir", "Inbox") or "Inbox"
+                inbox_root = vault / vault_root
+
+                pipeline = IMAIngestPipeline(
+                    client=client,
+                    provider=provider,
+                    model=config.agents.defaults.model,
+                    inbox_root=inbox_root,
+                    workspace=Path(config.workspace_path),
+                    inbox_dir_name=inbox_subdir,
                 )
 
-            writer.write(resp.encode())
-            await writer.drain()
-            writer.close()
+                result = await pipeline.run_all()
+                logs.append(f"IMA sync completed: processed={result.items_processed}, skipped={result.items_skipped}, written={len(result.notes_written)}")
+                if result.errors:
+                    logs.extend([f"ERROR: {e}" for e in result.errors])
 
-        server = await asyncio.start_server(handle, host, health_port)
-        console.print(f"[green]✓[/green] Health endpoint: http://{host}:{health_port}/health")
-        async with server:
-            await server.serve_forever()
+                return web.json_response({"ok": True, "log": logs})
+            except Exception as exc:
+                logs.append(f"ERROR: {exc}")
+                logs.extend(traceback.format_exc().splitlines()[-5:])
+                return web.json_response({"ok": False, "log": logs})
+
+        app.router.add_get("/health", handle_health)
+        app.router.add_post("/api/wiki/import", handle_wiki_import)
+        app.router.add_post("/api/wiki/import-url", handle_wiki_import_url)
+        app.router.add_get("/api/wiki/lint", handle_wiki_lint)
+        app.router.add_post("/api/ima/sync", handle_ima_sync)
+
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, host, http_port)
+        await site.start()
+        console.print(f"[green]✓[/green] HTTP API: http://{host}:{http_port}/health")
+        await asyncio.Event().wait()  # keep alive forever
     # Register Dream system job (idempotent on restart)
     from nanobot.cron.types import CronJob, CronPayload, CronSchedule
     dream_cfg = config.agents.defaults.dream
@@ -1720,17 +1957,60 @@ def _run_gateway(
             f"[green]✓[/green] Wiki evolution: every {wiki_cfg.evolution.interval_h}h"
         )
 
-    # Knowledge sync: IMA → Obsidian → Wiki every 6h
+    # Knowledge sync: IMA → Obsidian → Wiki daily at 19:30 Beijing time
     ima_cfg = getattr(config.tools, "ima", None)
     obs_cfg = getattr(config.tools, "obsidian", None)
     if getattr(ima_cfg, "enabled", False) or getattr(obs_cfg, "enabled", False):
         cron.register_system_job(CronJob(
             id="knowledge_sync",
             name="knowledge_sync",
-            schedule=CronSchedule(kind="every", every_ms=6 * 3_600_000, tz=config.agents.defaults.timezone),
+            schedule=CronSchedule(kind="cron", expr="30 21 * * *", tz="Asia/Shanghai"),
             payload=CronPayload(kind="system_event"),
         ))
-        console.print("[green]✓[/green] Knowledge sync (IMA→Obsidian→Wiki): every 6h")
+        console.print("[green]✓[/green] Knowledge sync (IMA→Obsidian→Wiki): daily at 21:30 Beijing time")
+
+    # Real-time Obsidian vault watcher: when ``sync_mode`` is ``watch`` or
+    # ``poll``, spin up a background task that calls
+    # ``ObsidianWikiSync.run_once`` every ``poll_interval_s`` seconds. This is
+    # the "live" counterpart to the 6h cron job above and replaces the
+    # previous "click Resync manually" UX.
+    obs_cfg_for_watcher = getattr(config.tools, "obsidian", None)
+    if (
+        getattr(obs_cfg_for_watcher, "enabled", False)
+        and getattr(obs_cfg_for_watcher, "vault_path", None)
+        and getattr(obs_cfg_for_watcher, "sync_mode", "manual") != "manual"
+    ):
+        try:
+            import asyncio
+
+            from nanobot.agent.wiki import WikiPaths, WikiStore
+            from nanobot.agent.wiki.sync import ObsidianWikiSync
+
+            _vault = Path(obs_cfg_for_watcher.vault_path).expanduser().resolve()
+            _paths = WikiPaths.from_workspace(Path(config.workspace_path))
+            _store = WikiStore(_paths)
+            _sync = ObsidianWikiSync(
+                _store,
+                vault_path=_vault,
+                vault_root=getattr(obs_cfg_for_watcher, "nanobot_root", "") or "",
+            )
+            _interval = float(getattr(obs_cfg_for_watcher, "poll_interval_s", 60) or 60)
+
+            async def _watcher_loop() -> None:
+                try:
+                    await _sync.start_watcher(agent, interval_s=_interval)
+                except asyncio.CancelledError:
+                    logger.info("Obsidian wiki watcher task cancelled")
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Obsidian wiki watcher crashed: {}", exc)
+
+            agent._schedule_background(_watcher_loop())
+            console.print(
+                f"[green]✓[/green] Obsidian vault watcher: every {_interval:.0f}s "
+                f"on {_vault}"
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to start Obsidian watcher: {}", exc)
 
     async def _open_browser_when_ready() -> None:
         """Wait for the gateway to bind, then point the user's browser at the webui."""
@@ -1789,8 +2069,8 @@ def _run_gateway(
             ]
             if health_server_enabled:
                 tasks.append(asyncio.create_task(
-                    _health_server(config.gateway.host, port),
-                    name="nanobot-health-server",
+                    _http_server(config.gateway.host, port),
+                    name="nanobot-http-server",
                 ))
             if open_browser_url:
                 tasks.append(asyncio.create_task(

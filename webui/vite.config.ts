@@ -74,6 +74,9 @@ export default defineConfig(({ mode }) => {
       },
       proxy: {
         "/webui": { target, changeOrigin: true },
+        "/api/wiki/import": { target: "http://127.0.0.1:18790", changeOrigin: true },
+        "/api/wiki/import-url": { target: "http://127.0.0.1:18790", changeOrigin: true },
+        "/api/ima/sync": { target: "http://127.0.0.1:18790", changeOrigin: true },
         "/api": { target, changeOrigin: true },
         "/auth": { target, changeOrigin: true },
       },

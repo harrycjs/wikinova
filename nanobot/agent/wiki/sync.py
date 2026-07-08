@@ -172,12 +172,14 @@ class ObsidianWikiSync:
                     result.skipped.append(rel)
                     continue
                 gen = WikiGenerator(self.store)
-                outcome = await gen.generate_from_vault_file(
+                logger.info("WikiSync: ingesting {} with title '{}'", rel, vault_file.stem)
+                outcome = await gen.ingest_source(
                     agent,
                     vault_path=vault_file,
                     note_body=body,
                     title=vault_file.stem,
                 )
+                logger.info("WikiSync: generated {} pages: {}", len(outcome.pages_written), outcome.pages_written)
                 result.generated.extend(outcome.pages_written)
                 if outcome.skipped_reason:
                     result.skipped.append(rel)

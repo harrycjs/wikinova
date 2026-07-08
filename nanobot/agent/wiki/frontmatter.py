@@ -21,8 +21,11 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any
+
+# Beijing timezone (UTC+8)
+BEIJING_TZ = timezone(timedelta(hours=8))
 
 # Match the first ``---``-delimited block at the top of the file.
 _FRONTMATTER_RE = re.compile(
@@ -158,7 +161,7 @@ def render_page(
 
     Stamps ``updated`` (and ``created`` if empty) to ``now``.
     """
-    ts = (now or datetime.now(timezone.utc)).isoformat()
+    ts = (now or datetime.now(BEIJING_TZ)).isoformat()
     if not fm.created:
         fm.created = ts
     fm.updated = ts

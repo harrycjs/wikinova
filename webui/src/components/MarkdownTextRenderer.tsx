@@ -22,6 +22,7 @@ import {
   isFilePatternReference,
   isLikelyFilePath,
 } from "@/components/FileReferenceChip";
+import { WikiCitationToken } from "@/components/wiki/WikiHoverCard";
 import { inferMediaKind } from "@/lib/media";
 import { faviconUrls } from "@/lib/provider-brand";
 import { remarkTexMath } from "@/lib/remark-tex-math";
@@ -42,6 +43,7 @@ type MarkdownAstNode = {
   children?: MarkdownAstNode[];
   data?: {
     hName?: string;
+    hProperties?: Record<string, unknown>;
   };
 };
 
@@ -187,12 +189,69 @@ function remarkSafeHtmlSubset() {
   };
 }
 
+/**
+ * Remark plugin: splits text nodes on ``[wiki:slug]`` markers and replaces
+ * each citation with a custom ``nanobotWikiCitation`` AST node. The custom
+ * node is rendered by the corresponding entry in the React-Markdown
+ * ``components`` map (``WikiCitationToken`` with hover-card preview).
+ *
+ * The agent's knowledge-qa skill mandates this format (see
+ * ``nanobot/skills/knowledge-qa/SKILL.md``). Pre-splitting in the AST
+ * keeps React rendering cheap (one render per token, not one per text node).
+ */
+const WIKI_CITATION_RE = /\[wiki:([a-z][a-z0-9-]{0,95})\]/g;
+
+function splitTextOnCitations(value: string): MarkdownAstNode[] {
+  const out: MarkdownAstNode[] = [];
+  let lastIndex = 0;
+  // Reset shared regex state.
+  WIKI_CITATION_RE.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = WIKI_CITATION_RE.exec(value)) !== null) {
+    if (match.index > lastIndex) {
+      out.push({ type: "text", value: value.slice(lastIndex, match.index) });
+    }
+    out.push({
+      type: "nanobotWikiCitation",
+      data: { hProperties: { slug: match[1] } },
+      children: [{ type: "text", value: match[1] }],
+    });
+    lastIndex = match.index + match[0].length;
+  }
+  if (lastIndex < value.length) {
+    out.push({ type: "text", value: value.slice(lastIndex) });
+  }
+  return out;
+}
+
+function remarkWikiCitation() {
+  const visit = (node: MarkdownAstNode): void => {
+    if (Array.isArray(node.children)) {
+      const next: MarkdownAstNode[] = [];
+      for (const child of node.children) {
+        if (child.type === "text" && typeof child.value === "string" && WIKI_CITATION_RE.test(child.value)) {
+          WIKI_CITATION_RE.lastIndex = 0;
+          next.push(...splitTextOnCitations(child.value));
+        } else {
+          visit(child);
+          next.push(child);
+        }
+      }
+      node.children = next;
+    }
+  };
+  return (tree: MarkdownAstNode) => {
+    visit(tree);
+  };
+}
+
 const remarkPlugins: NonNullable<ReactMarkdownOptions["remarkPlugins"]> = [
   remarkBreaks,
   remarkGfm,
   [remarkMath, { singleDollarTextMath: false }],
   remarkTexMath,
   remarkSafeHtmlSubset,
+  remarkWikiCitation,
 ];
 const rehypePlugins: NonNullable<ReactMarkdownOptions["rehypePlugins"]> = [rehypeKatex];
 
@@ -586,6 +645,12 @@ export default function MarkdownTextRenderer({
             inline
           />
         );
+      },
+      // Custom AST node produced by the ``remarkWikiCitation`` plugin. Renders
+      // the citation badge with hover-card preview. The actual splitting of
+      // text into citation tokens happens in the remark pass, not here.
+      nanobotWikiCitation({ slug }: { slug: string }) {
+        return <WikiCitationToken slug={slug} />;
       },
     }),
     [highlightCode, onOpenFilePreview],

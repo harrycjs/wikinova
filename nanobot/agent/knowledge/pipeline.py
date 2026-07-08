@@ -142,7 +142,7 @@ class IMAIngestPipeline:
 
     # -- IMA fetch -------------------------------------------------------
 
-    async def _fetch_notes(self, *, limit: int = 50) -> list[dict[str, Any]]:
+    async def _fetch_notes(self, *, limit: int = 20) -> list[dict[str, Any]]:
         """Fetch the user's IMA notes (cursor-paginated, up to one full sweep)."""
         out: list[dict[str, Any]] = []
         cursor = ""
@@ -162,13 +162,13 @@ class IMAIngestPipeline:
     async def _list_knowledge_bases(self) -> list[dict[str, Any]]:
         """List all the user's IMA knowledge bases."""
         try:
-            data = await self.client.search_knowledge_base(query="", limit=50)
+            data = await self.client.search_knowledge_base(query="", limit=20)
         except IMAError as exc:
             logger.warning("IMA search_knowledge_base failed: {}", exc)
             return []
         return data.get("info_list") or []
 
-    async def _fetch_kb_items(self, kb_id: str, *, limit: int = 50) -> list[dict[str, Any]]:
+    async def _fetch_kb_items(self, kb_id: str, *, limit: int = 20) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
         cursor = ""
         for _ in range(20):

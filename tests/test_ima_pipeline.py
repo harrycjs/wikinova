@@ -12,7 +12,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from nanobot.agent.knowledge.pipeline import IMAIngestPipeline
+from nanobot.agent.knowledge.pipeline import IMAIngestPipeline, PipelineResult
 from nanobot.agent.tools.ima._client import IMAClient, IMAError
 from nanobot.agent.tools.ima._encoding import best_effort_decode, ensure_utf8, to_utf8_bytes
 
@@ -384,3 +384,273 @@ def test_pipeline_frontmatter_dict_returns_none_when_no_block() -> None:
         workspace=Path("/tmp"),
     )
     assert pipeline._frontmatter_dict("# no frontmatter\n\nbody") is None
+
+
+# ---------------------------------------------------------------------------
+# IMAIngestPipeline — cursor advances only on full success
+# ---------------------------------------------------------------------------
+
+
+class _FakeIMAClient:
+    """In-memory IMA client with no real HTTP I/O.
+
+    Each helper can be overridden per-test to simulate the failure mode we
+    want (network error, empty content, LLM error, write error).
+    """
+
+    def __init__(
+        self,
+        *,
+        notes: list[dict[str, Any]] | None = None,
+        fetch_content_map: dict[str, str] | None = None,
+    ):
+        self._notes = notes or []
+        self._fetch_content_map = fetch_content_map or {}
+        self.has_credentials_called = False
+
+    def has_credentials(self) -> bool:
+        self.has_credentials_called = True
+        return True
+
+    async def list_note(self, *, cursor: str = "", limit: int = 100) -> dict[str, Any]:
+        return {"note_list": list(self._notes), "is_end": True, "next_cursor": ""}
+
+    async def get_doc_content(self, *, note_id: str, content_format: int = 0) -> dict[str, Any]:
+        text = self._fetch_content_map.get(note_id, "")
+        return {"content": text}
+
+    async def get_media_info(self, *, media_id: str) -> dict[str, Any]:
+        # Returns no URL — pipeline will treat this as "empty content".
+        return {"data": {"url_info": {}}}
+
+
+def _good_summary_md(note_id: str) -> str:
+    return (
+        "---\n"
+        'title: "测试笔记"\n'
+        f"slug: note-{note_id}\n"
+        'tags: ["AI"]\n'
+        f"source_id: {note_id}\n"
+        "captured_at: 2026-07-07T00:00:00\n"
+        "summary: 这是一篇测试笔记。\n"
+        "---\n"
+        "\n## Background\nSome body content.\n"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_once_cursor_advances_only_for_successful_writes(tmp_path: Path) -> None:
+    """Three notes: A succeeds, B fails at fetch, C succeeds. Cursor should
+    contain only A and C — B must retry on next run."""
+    inbox_root = tmp_path / "vault"
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    notes = [
+        {"note_id": "a", "title": "Note A"},
+        {"note_id": "b", "title": "Note B"},
+        {"note_id": "c", "title": "Note C"},
+    ]
+    client = _FakeIMAClient(
+        notes=notes,
+        fetch_content_map={"a": "content for A", "c": "content for C"},
+    )
+
+    # Override get_doc_content so only B raises — simulates a transient fetch
+    # failure that should NOT advance the cursor.
+    async def selective_get(*, note_id: str, content_format: int = 0) -> dict[str, Any]:
+        if note_id == "b":
+            raise IMAError(code=-100, message="network down")
+        return await _FakeIMAClient.get_doc_content(client, note_id=note_id, content_format=content_format)
+
+    client.get_doc_content = selective_get  # type: ignore[assignment]
+
+    # Build a provider that returns a different good summary per note_id.
+    # The prompt embeds "来源 ID：<id>" right before "原始内容：" — match on that.
+    import re as _re
+
+    response_per_id = {nid: _good_summary_md(nid) for nid in ("a", "b", "c")}
+    provider = _StubProvider("")  # type: ignore[arg-type]
+
+    summarize_calls: list[str] = []
+
+    async def chat(self, *, messages, model, settings, tools=None):
+        prompt_text = messages[0]["content"] if messages else ""
+        m = _re.search(r"来源 ID：([a-z])", prompt_text)
+        if m:
+            nid = m.group(1)
+            summarize_calls.append(nid)
+            sub = _StubProvider(response_per_id[nid])  # type: ignore[arg-type]
+            return await sub.chat(
+                messages=messages, model=model, settings=settings, tools=tools
+            )
+        sub = _StubProvider("")  # type: ignore[arg-type]
+        return await sub.chat(messages=messages, model=model, settings=settings, tools=tools)
+
+    import types
+
+    provider.chat = types.MethodType(chat, provider)  # type: ignore[assignment]
+
+    pipeline = IMAIngestPipeline(
+        client=client,  # type: ignore[arg-type]
+        provider=provider,  # type: ignore[arg-type]
+        model="stub-model",
+        inbox_root=inbox_root,
+        workspace=workspace,
+    )
+
+    result = await pipeline.run_once(max_items=10)
+
+    # A and C succeed, B fails at fetch (returns "" because IMAError is caught
+    # inside _fetch_note_content). Use today's date for the file path.
+    from datetime import datetime, timezone
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    expected = sorted([f"Inbox/{today}-note-a.md", f"Inbox/{today}-note-c.md"])
+    assert sorted(result.notes_written) == expected
+    assert result.items_processed == 2
+    assert result.items_skipped == 1
+    # B's failure is recorded. _fetch_note_content swallows IMAError and returns
+    # "", so the surface reason is "empty content" rather than "fetch_content".
+    assert "note:b" in result.failure_reasons
+    # Cursor advanced for A and C only — B NOT in cursor.
+    cursor = pipeline._read_cursor()
+    assert sorted(cursor["notes"]) == ["a", "c"]
+
+
+@pytest.mark.asyncio
+async def test_run_once_skips_note_with_no_id(tmp_path: Path) -> None:
+    """A note with neither ``note_id`` nor ``id`` is skipped and not advanced."""
+    inbox_root = tmp_path / "vault"
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    client = _FakeIMAClient(notes=[{"title": "Mystery"}])  # no id
+    provider = _StubProvider("")  # type: ignore[arg-type]
+    pipeline = IMAIngestPipeline(
+        client=client,  # type: ignore[arg-type]
+        provider=provider,  # type: ignore[arg-type]
+        model="stub-model",
+        inbox_root=inbox_root,
+        workspace=workspace,
+    )
+
+    result = await pipeline.run_once(max_items=10)
+
+    assert result.items_processed == 0
+    assert result.items_skipped == 1
+    assert result.failure_reasons.get("note:<no-id>") == "missing note_id"
+    cursor = pipeline._read_cursor()
+    assert cursor.get("notes") == []
+
+
+@pytest.mark.asyncio
+async def test_run_once_does_not_advance_cursor_when_write_fails(tmp_path: Path) -> None:
+    """A note whose write fails must NOT be added to the cursor."""
+    inbox_root = tmp_path / "vault"
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    client = _FakeIMAClient(
+        notes=[{"note_id": "x", "title": "Note X"}],
+        fetch_content_map={"x": "valid body"},
+    )
+    provider = _StubProvider(_good_summary_md("x"))  # type: ignore[arg-type]
+
+    pipeline = IMAIngestPipeline(
+        client=client,  # type: ignore[arg-type]
+        provider=provider,  # type: ignore[arg-type]
+        model="stub-model",
+        inbox_root=inbox_root,
+        workspace=workspace,
+    )
+
+    # Force _write_summary_to_inbox to return None by patching it.
+    pipeline._write_summary_to_inbox = lambda **kwargs: None  # type: ignore[assignment]
+
+    result = await pipeline.run_once(max_items=10)
+
+    assert result.items_processed == 0
+    assert result.items_skipped == 1
+    assert result.failure_reasons.get("note:x") == "write to inbox failed"
+
+    cursor = pipeline._read_cursor()
+    # Note x must NOT be in the cursor.
+    assert "x" not in (cursor.get("notes") or [])
+
+
+@pytest.mark.asyncio
+async def test_run_once_does_not_advance_cursor_when_llm_returns_empty(tmp_path: Path) -> None:
+    """A note whose LLM call returns empty must NOT be added to the cursor."""
+    inbox_root = tmp_path / "vault"
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    client = _FakeIMAClient(
+        notes=[{"note_id": "y", "title": "Note Y"}],
+        fetch_content_map={"y": "valid body"},
+    )
+    provider = _StubProvider("")  # type: ignore[arg-type]
+
+    pipeline = IMAIngestPipeline(
+        client=client,  # type: ignore[arg-type]
+        provider=provider,  # type: ignore[arg-type]
+        model="stub-model",
+        inbox_root=inbox_root,
+        workspace=workspace,
+    )
+
+    result = await pipeline.run_once(max_items=10)
+
+    assert result.items_processed == 0
+    assert result.items_skipped == 1
+    assert result.failure_reasons.get("note:y") == "summarize returned empty"
+
+    cursor = pipeline._read_cursor()
+    assert "y" not in (cursor.get("notes") or [])
+
+
+@pytest.mark.asyncio
+async def test_run_once_preserves_existing_cursor_when_no_notes(tmp_path: Path) -> None:
+    """If processing yields no items, the existing cursor entries stay intact."""
+    inbox_root = tmp_path / "vault"
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    pipeline = IMAIngestPipeline(
+        client=IMAClient(),  # type: ignore[arg-type]
+        provider=_StubProvider(""),  # type: ignore[arg-type]
+        model="stub-model",
+        inbox_root=inbox_root,
+        workspace=workspace,
+    )
+
+    # Seed an existing cursor.
+    pipeline._write_cursor({"notes": ["prev1", "prev2"], "updated_at": "2026-07-01"})
+
+    # Use a fake client that returns no notes — should not clobber existing cursor.
+    client = _FakeIMAClient(notes=[])
+    pipeline.client = client  # type: ignore[assignment]
+
+    result = await pipeline.run_once(max_items=10)
+
+    assert result.items_processed == 0
+    cursor = pipeline._read_cursor()
+    # Existing ids should be preserved (no notes processed this run).
+    assert sorted(cursor["notes"]) == ["prev1", "prev2"]
+
+
+def test_pipeline_result_to_dict_includes_failure_reasons() -> None:
+    """Smoke test: failure_reasons is part of the serialized dict."""
+    result = PipelineResult(
+        items_processed=1,
+        items_skipped=2,
+        notes_written=["Inbox/x.md"],
+        errors=["creds missing"],
+        failure_reasons={"note:b": "fetch_content: timeout"},
+    )
+    payload = result.to_dict()
+    assert payload["items_processed"] == 1
+    assert payload["items_skipped"] == 2
+    assert payload["notes_written"] == ["Inbox/x.md"]
+    assert payload["failure_reasons"] == {"note:b": "fetch_content: timeout"}

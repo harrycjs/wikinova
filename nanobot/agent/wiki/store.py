@@ -21,7 +21,10 @@ import os
 import re
 import threading
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+
+# Beijing timezone (UTC+8)
+BEIJING_TZ = timezone(timedelta(hours=8))
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -169,7 +172,7 @@ class WikiStore:
             fm.title = slug.replace("-", " ").title()
         sha = hashlib.sha256(raw.encode("utf-8")).hexdigest()
         stat = page_path.stat()
-        mtime = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat()
+        mtime = datetime.fromtimestamp(stat.st_mtime, tz=BEIJING_TZ).isoformat()
         return WikiPage(
             slug=slug,
             title=fm.title,
@@ -234,7 +237,7 @@ class WikiStore:
 
             sha = hashlib.sha256(rendered.encode("utf-8")).hexdigest()
             stat = page_path.stat()
-            mtime = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat()
+            mtime = datetime.fromtimestamp(stat.st_mtime, tz=BEIJING_TZ).isoformat()
             page = WikiPage(
                 slug=slug,
                 title=fm.title,

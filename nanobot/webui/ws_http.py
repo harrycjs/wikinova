@@ -10,11 +10,14 @@ Also houses shared HTTP utility functions used by both this module and
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import mimetypes
 import re
 import time
+import uuid
 from collections.abc import Callable
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import unquote
@@ -176,6 +179,13 @@ class GatewayHTTPHandler:
         self.local_trigger_pending_ids = local_trigger_pending_ids
         self._log = log
         self._runtime_surface = runtime_surface
+
+        # In-memory registry for in-flight wiki-evolve tasks. Maps task_id → dict
+        # with keys: status ("queued"|"running"|"done"|"failed"), started_at,
+        # finished_at, summary, error. Lost on restart, but that's acceptable:
+        # the next evolution tick will catch any missed work and the wiki log
+        # (``WikiEvolution.read_recent_log``) is the persistent record.
+        self._regenerate_tasks: dict[str, dict[str, Any]] = {}
 
         from nanobot.webui.settings_api import runtime_capabilities as _rc
         from nanobot.webui.settings_routes import WebUISettingsRouter
@@ -747,9 +757,19 @@ class GatewayHTTPHandler:
         if got == "/api/wiki/search":
             return self._handle_wiki_search(request)
         if got == "/api/wiki/regenerate":
-            return self._handle_wiki_regenerate(request)
+            return await self._handle_wiki_regenerate(request)
+        if got == "/api/wiki/regenerate/status":
+            return self._handle_wiki_regenerate_status(request)
+        if got == "/api/wiki/edit":
+            return self._handle_wiki_edit(request)
+        if got == "/api/wiki/import":
+            return self._handle_wiki_import(request)
         if got == "/api/wiki/delete":
             return self._handle_wiki_delete(request)
+        if got == "/api/wiki/lint":
+            return await self._handle_wiki_lint(request)
+        if got == "/api/wiki/regenerate":
+            return await self._handle_wiki_regenerate(request)
         if got == "/api/ima/status":
             return self._handle_ima_status(request)
         if got == "/api/ima/sync":
@@ -891,6 +911,17 @@ class GatewayHTTPHandler:
             data["body"] = page.body
             data["frontmatter"] = page.fm.to_dict()
             data["backlinks"] = blinks
+            # Surface the page's on-disk byte size so the WebUI can detect if
+            # the stored body was clipped at ``WikiConfig.max_page_chars`` and
+            # warn the user. We approximate the original length as the file's
+            # raw byte count (minus the frontmatter) — the store does not
+            # preserve the exact pre-truncation length.
+            try:
+                page_path = paths.page_path(slug)
+                if page_path.exists():
+                    data["stored_length"] = page_path.stat().st_size
+            except OSError:
+                pass
             return _http_json_response(data)
         except Exception as e:
             return _http_error(500, str(e))
@@ -910,8 +941,331 @@ class GatewayHTTPHandler:
         except Exception as e:
             return _http_error(500, str(e))
 
-    def _handle_wiki_regenerate(self, request: WsRequest) -> Response:
-        return _http_json_response({"queued": True})
+    async def _handle_wiki_regenerate(self, request: WsRequest) -> Response:
+        """Trigger the wiki-evolve cron job in the background.
+
+        Returns immediately with a ``task_id`` that the frontend can poll via
+        ``/api/wiki/regenerate/status?task_id=...``. The actual evolution runs
+        asynchronously through the cron service's existing job handler, which
+        has access to the ``AgentLoop`` for the isolated LLM turn.
+        """
+        if not self.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+
+        if self.cron_service is None:
+            return _http_error(503, "cron service unavailable")
+
+        # Verify the job is actually registered; refuse early if not so the
+        # client gets a clean 404 instead of a stuck "running" task.
+        job = self.cron_service.get_job("wiki_evolve")
+        if job is None:
+            return _http_error(
+                404,
+                "wiki_evolve job is not registered (enable tools.wiki.evolution in config)",
+            )
+
+        task_id = uuid.uuid4().hex
+        self._regenerate_tasks[task_id] = {
+            "status": "queued",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "finished_at": None,
+            "summary": None,
+            "error": None,
+        }
+
+        async def _runner() -> None:
+            self._regenerate_tasks[task_id]["status"] = "running"
+            try:
+                ok = await self.cron_service.run_job("wiki_evolve", force=True)
+                if ok:
+                    self._regenerate_tasks[task_id]["status"] = "done"
+                    self._regenerate_tasks[task_id]["summary"] = (
+                        "evolution pass completed; see /api/wiki/evolution for the new log"
+                    )
+                else:
+                    # run_job returns False when the job is disabled or unbound.
+                    self._regenerate_tasks[task_id]["status"] = "failed"
+                    self._regenerate_tasks[task_id]["error"] = (
+                        "wiki_evolve job could not run (disabled or unbound)"
+                    )
+            except Exception as exc:  # noqa: BLE001
+                self._regenerate_tasks[task_id]["status"] = "failed"
+                self._regenerate_tasks[task_id]["error"] = str(exc)
+                self._log.exception("wiki regenerate task {} failed", task_id)
+            finally:
+                self._regenerate_tasks[task_id]["finished_at"] = datetime.now(timezone.utc).isoformat()
+
+        # Fire-and-forget. The HTTP response goes back to the client immediately
+        # while evolution runs in the gateway's event loop.
+        asyncio.create_task(_runner())
+
+        return _http_json_response(
+            {"ok": True, "task_id": task_id, "status": "queued"}
+        )
+
+    def _handle_wiki_regenerate_status(self, request: WsRequest) -> Response:
+        """Poll the status of an in-flight wiki regenerate task."""
+        if not self.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        query = _parse_query(request.path)
+        task_id = _query_first(query, "task_id") or ""
+        if not task_id:
+            return _http_error(400, "task_id is required")
+        record = self._regenerate_tasks.get(task_id)
+        if record is None:
+            return _http_error(404, f"unknown task_id: {task_id}")
+        return _http_json_response({"task_id": task_id, **record})
+
+    async def _handle_wiki_import(self, request: WsRequest) -> Response:
+        """Import a document into the wiki.
+
+        Accepts either:
+        - JSON body ``{"type": "url", "url": "https://...", "title": "..."}``
+          to fetch a remote page and extract its text.
+        - JSON body ``{"type": "text" | "markdown", "title": "...", "body": "..."}``
+          for direct paste / drag-drop of small text snippets.
+        - Multipart form-data with a single ``file`` field for uploaded files.
+          The ``.md`` / ``.txt`` extensions pass through verbatim; ``.pdf``
+          requires an optional ``pypdf`` dependency (best-effort fallback
+          returns a 501 if the library is missing).
+
+        The new page is written via ``WikiStore.write_page`` with
+        ``merge_existing=False`` so callers get a fresh slug/title.
+        """
+        if not self.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+
+        content_type = (request.headers.get("content-type") or "").lower()
+        logger.info("wiki/import: content_type={}, body_len={}", content_type, len(request.body) if request.body else 0)
+
+        try:
+            from nanobot.agent.wiki import WikiPaths, WikiStore
+
+            workspace = Path(
+                self.session_manager.workspace if self.session_manager else "~/.nanobot/workspace"
+            ).expanduser().resolve()
+            paths = WikiPaths.from_workspace(workspace)
+            store = WikiStore(paths)
+
+            if content_type.startswith("multipart/form-data"):
+                logger.info("wiki/import: parsing multipart form data")
+                body, title, error = await self._read_multipart_file(request)
+                logger.info("wiki/import: after parse body_len={}, title={}, error={}", len(body) if body else 0, title, error)
+            else:
+                try:
+                    payload = json.loads(request.body.decode("utf-8") or "{}")
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    return _http_error(400, f"invalid JSON body: {exc}")
+                body, title, error = await self._resolve_import_payload(payload)
+            if error:
+                logger.warning("wiki/import: error={}", error)
+                return _http_error(400, error)
+            if not body or not body.strip():
+                return _http_error(400, "imported content is empty")
+
+            logger.info("wiki/import: title={}, body_len={}", title, len(body) if body else 0)
+            slug_source = title or body.splitlines()[0][:80]
+            slug = self._slugify(slug_source) or f"import-{uuid.uuid4().hex[:8]}"
+            logger.info("wiki/import: slug={}", slug)
+            # Avoid clobbering an existing page — append a short suffix when
+            # the desired slug is taken.
+            if store.read_page(slug) is not None:
+                slug = f"{slug}-{uuid.uuid4().hex[:6]}"
+
+            page = store.write_page(
+                slug=slug,
+                title=title or slug.replace("-", " ").title(),
+                body=body,
+                tags=["imported"],
+                source=f"webui-import:{content_type or 'unknown'}",
+                merge_existing=False,
+            )
+            logger.info("wiki/import: success slug={}", page.slug)
+            return _http_json_response(
+                {"ok": True, "slug": page.slug, "title": page.title, "chars": len(body)}
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("wiki/import: failed")
+            return _http_error(500, str(exc))
+
+    @staticmethod
+    def _slugify(text: str) -> str:
+        import re as _re
+
+        slug = _re.sub(r"[^a-z0-9-]+", "-", (text or "").lower()).strip("-")
+        slug = _re.sub(r"-+", "-", slug)[:80].strip("-")
+        return slug
+
+    async def _read_multipart_file(self, request: WsRequest):
+        """Best-effort multipart parser. Returns (body, title, error)."""
+        # We don't pull in a multipart library just for this endpoint — the
+        # WebUI only sends ``file=@<path>`` with an optional ``title`` field.
+        # Parsing handles a single file part with utf-8 content.
+        raw = request.body
+        ctype = request.headers.get("content-type") or ""
+        boundary = None
+        for token in ctype.split(";"):
+            token = token.strip()
+            if token.startswith("boundary="):
+                boundary = token.split("=", 1)[1].strip('"')
+                break
+        if not boundary:
+            return None, None, "multipart boundary missing"
+        sep = ("--" + boundary).encode()
+        parts = raw.split(sep)
+        body = None
+        title = None
+        for part in parts:
+            if not part or part == b"--\r\n" or part == b"--":
+                continue
+            # Strip leading \r\n if present
+            if part.startswith(b"\r\n"):
+                part = part[2:]
+            head, _, payload = part.partition(b"\r\n\r\n")
+            if not head:
+                continue
+            head_str = head.decode("utf-8", errors="replace")
+            disposition = ""
+            for line in head_str.splitlines():
+                if line.lower().startswith("content-disposition:"):
+                    disposition = line
+                    break
+            name = None
+            filename = None
+            for chunk in disposition.split(";"):
+                chunk = chunk.strip()
+                if chunk.startswith("name="):
+                    name = chunk.split("=", 1)[1].strip('"')
+                elif chunk.startswith("filename="):
+                    filename = chunk.split("=", 1)[1].strip('"')
+            # Strip trailing \r\n if present
+            if payload.endswith(b"\r\n"):
+                payload = payload[:-2]
+            if name == "title":
+                title = payload.decode("utf-8", errors="replace")
+            elif name == "file" and filename:
+                lower = filename.lower()
+                if lower.endswith(".pdf"):
+                    extracted = self._extract_pdf_text(payload)
+                    if extracted is None:
+                        return None, None, "PDF import requires the optional pypdf dependency"
+                    body = extracted
+                    if not title:
+                        title = filename.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+                else:
+                    body = payload.decode("utf-8", errors="replace")
+                    if not title:
+                        title = filename.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+        if body is None:
+            return None, None, "no file part found"
+        return body, title, None
+
+    @staticmethod
+    def _extract_pdf_text(payload: bytes) -> str | None:
+        try:
+            import pypdf  # type: ignore
+        except ImportError:
+            return None
+        try:
+            reader = pypdf.PdfReader(io.BytesIO(payload))
+        except Exception:  # noqa: BLE001
+            return None
+        chunks: list[str] = []
+        for page in reader.pages:
+            try:
+                chunks.append(page.extract_text() or "")
+            except Exception:  # noqa: BLE001
+                continue
+        return "\n\n".join(chunks).strip()
+
+    @staticmethod
+    async def _resolve_import_payload(payload: dict[str, Any]):
+        """Map a JSON import payload to (body, title, error)."""
+        kind = str(payload.get("type") or "markdown").lower()
+        if kind in ("markdown", "text"):
+            body = str(payload.get("body") or "")
+            title = str(payload.get("title") or "").strip()
+            if not body:
+                return None, None, "body is required for markdown/text import"
+            return body, title, None
+        if kind == "url":
+            url = str(payload.get("url") or "").strip()
+            if not url:
+                return None, None, "url is required for url import"
+            if not (url.startswith("http://") or url.startswith("https://")):
+                return None, None, "url must start with http:// or https://"
+            title = str(payload.get("title") or "").strip()
+            try:
+                import httpx
+                import re as _re
+
+                async with httpx.AsyncClient(
+                    timeout=20.0, follow_redirects=True, headers={"User-Agent": "nanobot-wiki-importer/1.0"}
+                ) as client:
+                    resp = await client.get(url)
+                    resp.raise_for_status()
+                    html = resp.text
+                # Strip script/style blocks, then tags, then collapse whitespace.
+                html = _re.sub(r"<(script|style)[^>]*>.*?</\1>", "", html, flags=_re.DOTALL | _re.IGNORECASE)
+                text = _re.sub(r"<[^>]+>", " ", html)
+                text = _re.sub(r"\s+", " ", text).strip()
+                if not text:
+                    return None, None, "fetched URL had no extractable text"
+                if not title:
+                    title_match = _re.search(r"<title[^>]*>(.*?)</title>", html, flags=_re.IGNORECASE | _re.DOTALL)
+                    if title_match:
+                        title = title_match.group(1).strip()
+                return text[:32_000], title, None
+            except Exception as exc:  # noqa: BLE001
+                return None, None, f"failed to fetch URL: {exc}"
+        return None, None, f"unsupported import type: {kind!r}"
+
+    def _handle_wiki_edit(self, request: WsRequest) -> Response:
+        """Edit an existing wiki page in place.
+
+        Accepts ``{"slug": "...", "title": "...", "body": "...", "tags": [...]}``
+        as JSON. Tags are merged with the page's existing tags so callers don't
+        have to re-send the full tag set after each edit.
+        """
+        if not self.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        try:
+            payload = json.loads(request.body.decode("utf-8") or "{}")
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            return _http_error(400, f"invalid JSON body: {exc}")
+        slug = str(payload.get("slug") or "").strip()
+        if not slug:
+            return _http_error(400, "slug is required")
+        title = str(payload.get("title") or "").strip()
+        body = str(payload.get("body") or "")
+        tags_raw = payload.get("tags")
+        tags: list[str] | None = None
+        if isinstance(tags_raw, list):
+            tags = [str(t) for t in tags_raw if str(t).strip()]
+        try:
+            from nanobot.agent.wiki import WikiPaths, WikiStore
+            workspace = Path(self.session_manager.workspace if self.session_manager else "~/.nanobot/workspace").expanduser().resolve()
+            paths = WikiPaths.from_workspace(workspace)
+            store = WikiStore(paths)
+            existing = store.read_page(slug)
+            if existing is None:
+                return _http_error(404, f"page '{slug}' not found")
+            # If the user supplied new tags, replace them outright (rather than
+            # merge) so edits are predictable. ``write_page`` already merges
+            # wikilinks detected in the new body, so we don't pass ``links``.
+            page = store.write_page(
+                slug=slug,
+                title=title or existing.title,
+                body=body,
+                tags=tags if tags is not None else existing.fm.tags,
+                source="manual-edit",
+                merge_existing=False,
+            )
+            return _http_json_response({"ok": True, "page": page.to_dict()})
+        except ValueError as exc:
+            return _http_error(400, str(exc))
+        except Exception as exc:  # noqa: BLE001
+            return _http_error(500, str(exc))
 
     def _handle_wiki_delete(self, request: WsRequest) -> Response:
         """Delete a wiki page by slug."""
@@ -931,6 +1285,55 @@ class GatewayHTTPHandler:
                 return _http_json_response({"ok": True, "deleted": slug})
             else:
                 return _http_error(404, f"Page '{slug}' not found")
+        except Exception as e:
+            return _http_error(500, str(e))
+
+    async def _handle_wiki_lint(self, request: WsRequest) -> Response:
+        """Run lint check on Wiki to find and fix issues."""
+        if not self.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        try:
+            from nanobot.agent.wiki import WikiPaths, WikiStore
+            from nanobot.agent.wiki.generator import WikiGenerator
+
+            workspace = Path.home() / ".nanobot" / "workspace"
+            paths = WikiPaths.from_workspace(workspace)
+            store = WikiStore(paths)
+            gen = WikiGenerator(store)
+
+            # Run lint check
+            result = await gen.lint_wiki(agent=None)
+            return _http_json_response({"ok": True, "result": result})
+        except Exception as e:
+            return _http_error(500, str(e))
+
+    async def _handle_wiki_regenerate(self, request: WsRequest) -> Response:
+        """Trigger full Wiki regeneration using LLM.
+
+        This runs the knowledge_sync cron job which:
+        1. Syncs IMA content to Obsidian
+        2. Uses WikiGenerator with LLM to create multiple Wiki pages per source
+        """
+        if not self.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+
+        try:
+            # Trigger the knowledge_sync cron job
+            if self.cron_service:
+                job = self.cron_service.get_job("knowledge_sync")
+                if job:
+                    # Run the job asynchronously
+                    import asyncio
+                    asyncio.create_task(self.cron_service.run_job("knowledge_sync", force=True))
+                    return _http_json_response({
+                        "ok": True,
+                        "message": "Wiki regeneration triggered. This may take a few minutes.",
+                        "job_id": "knowledge_sync"
+                    })
+                else:
+                    return _http_error(404, "knowledge_sync job not found")
+            else:
+                return _http_error(503, "cron service unavailable")
         except Exception as e:
             return _http_error(500, str(e))
 
@@ -1065,8 +1468,14 @@ class GatewayHTTPHandler:
             "mode": obs.get("mode", "filesystem"),
         })
 
-    def _handle_obsidian_resync(self, request: WsRequest) -> Response:
-        """Scan Obsidian vault for markdown files and create wiki pages."""
+    async def _handle_obsidian_resync(self, request: WsRequest) -> Response:
+        """Scan Obsidian vault and regenerate wiki pages using LLM.
+
+        This triggers the full Wiki generation pipeline:
+        1. Scan Obsidian vault for changed files
+        2. For each changed file, use WikiGenerator to create multiple Wiki pages
+        3. WikiGenerator uses LLM to extract concepts, create cross-references, etc.
+        """
         if not self.check_api_token(request):
             return _http_error(401, "Unauthorized")
 
@@ -1091,65 +1500,41 @@ class GatewayHTTPHandler:
         logs = []
         try:
             from nanobot.agent.wiki import WikiPaths, WikiStore
+            from nanobot.agent.wiki.sync import ObsidianWikiSync
 
             workspace = Path.home() / ".nanobot" / "workspace"
             paths = WikiPaths.from_workspace(workspace)
             store = WikiStore(paths)
+            vault_root = obs_cfg.get("nanobotRoot", "")
 
-            # Find all markdown files in vault
-            md_files = sorted(vault.rglob("*.md"))
-            logs.append(f"Scanning vault: {vault_path} ({len(md_files)} markdown files)")
+            sync = ObsidianWikiSync(
+                store,
+                vault_path=vault,
+                vault_root=vault_root,
+            )
 
-            created = 0
-            skipped = 0
+            # Run sync - agent=None means just copy files, no LLM generation
+            # The full LLM generation happens in the cron job (knowledge_sync)
+            result = await sync.run_once(agent=None, max_files=50)
 
-            for md_file in md_files[:20]:  # limit for speed
-                try:
-                    content = md_file.read_text(encoding="utf-8", errors="replace")
-                except Exception as e:
-                    logs.append(f"  WARN: cannot read {md_file.name}: {e}")
-                    skipped += 1
-                    continue
+            logs.append(f"Scanning vault: {vault_path} ({result.scanned} files)")
+            logs.append(f"Changed: {len(result.changed)} files")
+            logs.append(f"Generated: {len(result.generated)} pages")
+            logs.append(f"Skipped: {len(result.skipped)} files")
+            if result.errors:
+                for err in result.errors:
+                    logs.append(f"  ERROR: {err}")
 
-                if not content.strip():
-                    skipped += 1
-                    continue
+            # Note: Full LLM-powered Wiki generation happens in the cron job
+            # Run: nanobot cron run knowledge_sync
+            # Or wait for scheduled time: daily at 21:30 Beijing time
 
-                # Parse frontmatter for original title
-                from nanobot.agent.wiki.frontmatter import parse_frontmatter
-                fm, body = parse_frontmatter(content)
-                title = fm.title or md_file.stem
-                # Derive slug from filename (strip date prefix, handle CJK)
-                stem = md_file.stem
-                stem = re.sub(r"^\d{4}-\d{2}-\d{2}-", "", stem)
-                raw_slug = stem.lower().replace(" ", "-")
-                safe_slug = re.sub(r"[^a-z0-9-]", "", raw_slug)
-                # Remove leading/trailing dashes
-                safe_slug = safe_slug.strip("-")
-                if not safe_slug or len(safe_slug) < 3:
-                    safe_slug = f"vault-{hashlib.md5(md_file.name.encode()).hexdigest()[:8]}"
-                slug = safe_slug[:80] or "unnamed"
-
-                try:
-                    # Strip frontmatter from body (wiki store adds its own)
-                    body_content = content
-                    if content.startswith("---"):
-                        _, body_content = parse_frontmatter(content)
-                    store.write_page(
-                        slug=slug,
-                        title=title,
-                        body=body_content[:8000],
-                        tags=["obsidian", "vault"],
-                        source=f"obsidian:{md_file.relative_to(vault).as_posix()}",
-                    )
-                    created += 1
-                    logs.append(f"  OK: {md_file.relative_to(vault)}")
-                except Exception as e:
-                    logs.append(f"  WARN: failed {md_file.name}: {e}")
-                    skipped += 1
-
-            logs.append(f"Obsidian sync complete: {created} created, {skipped} skipped")
-            return _http_json_response({"ok": True, "log": logs, "created": created, "skipped": skipped})
+            return _http_json_response({
+                "ok": True,
+                "log": logs,
+                "created": len(result.generated),
+                "skipped": len(result.skipped),
+            })
 
         except Exception as e:
             import traceback

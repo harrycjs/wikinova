@@ -16,9 +16,12 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+# Beijing timezone (UTC+8)
+BEIJING_TZ = timezone(timedelta(hours=8))
 
 from loguru import logger
 
@@ -161,7 +164,7 @@ class WikiEvolution:
         """One evolution pass. Safe to call from a cron job."""
         from nanobot.agent.wiki.tools import build_wiki_tool_registry
 
-        started_at = datetime.now(timezone.utc).isoformat()
+        started_at = datetime.now(BEIJING_TZ).isoformat()
         cursor_before = self.read_cursor()
 
         # Pull unprocessed history.
@@ -174,7 +177,7 @@ class WikiEvolution:
                 pages_changed=[],
                 summary="no unprocessed history",
                 started_at=started_at,
-                finished_at=datetime.now(timezone.utc).isoformat(),
+                finished_at=datetime.now(BEIJING_TZ).isoformat(),
             )
 
         batch = entries[-self.max_batch_entries :]
@@ -209,7 +212,7 @@ class WikiEvolution:
                 pages_changed=[],
                 summary="agent turn raised",
                 started_at=started_at,
-                finished_at=datetime.now(timezone.utc).isoformat(),
+                finished_at=datetime.now(BEIJING_TZ).isoformat(),
             )
 
         # Real diff gate.
@@ -235,7 +238,7 @@ class WikiEvolution:
             pages_changed=new_slugs,
             summary=summary,
             started_at=started_at,
-            finished_at=datetime.now(timezone.utc).isoformat(),
+            finished_at=datetime.now(BEIJING_TZ).isoformat(),
         )
         self.append_log(result.to_dict())
         return result
