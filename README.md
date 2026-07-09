@@ -117,12 +117,33 @@ nanobot gateway
 
 ## 定时任务
 
-| 任务 | 频率 | 作用 |
+| 任务 | 时间（北京时间） | 作用 |
 |---|---|---|
 | Dream | 每 2 小时 | 两阶段记忆合并：对话历史 → 工作记忆 → 长期记忆 |
 | Heartbeat | 每 30 分钟 | 检查 HEARTBEAT.md 中的活跃任务 |
 | Wiki Evolve | 每 6 小时 | 从对话历史提取新事实/偏好/实体更新 Wiki |
-| Knowledge Sync | 每日 21:30 | IMA 拉取 → Obsidian 总结 → Wiki 生成全链路 |
+| Knowledge Sync AM | **每日 12:25** | IMA 拉取 → Obsidian 总结 → Wiki 生成全链路 |
+| Knowledge Sync PM | **每日 17:40** | 同上，傍晚再跑一次 |
+
+## 微信文章正文抓取 (wxmp_operator)
+
+IMA OpenAPI 对微信公众号文章返回 `210005 GetNoteContent not author`（OpenAPI token 不是 KB 所有者），所以需要单独扫码登录拿 cookies。
+
+**一次性配置：** 在 Channels 页面 → **wxmp** Tab → 点「扫码登录」 → Edge 弹出 → 手机扫码 → 自动保存 96h 凭证。
+
+**自动 fallback 链路（`pipeline.py:_fetch_note_content`）：**
+
+1. `get_doc_content` — IMA 服务端提取的文本
+2. `get_media_info` + 直接 URL 抓取 — 静态网页可用
+3. **wxmp_operator** — 微信文章专用路径，用持久化的 operator cookies 抓 SSR HTML，提取 `<div id="js_content">` 内的正文
+
+凭证过期（>96h）后自动跳过微信文章，pipeline 不会写入占位笔记。需要重新扫码。
+
+### 手动重新扫码
+
+```bash
+nanobot channels login wxmp_platform --force
+```
 
 ## Wiki API
 

@@ -1970,10 +1970,10 @@ def _run_gateway(
         cron.register_system_job(CronJob(
             id="knowledge_sync_pm",
             name="knowledge_sync",
-            schedule=CronSchedule(kind="cron", expr="30 17 * * *", tz="Asia/Shanghai"),
+            schedule=CronSchedule(kind="cron", expr="40 17 * * *", tz="Asia/Shanghai"),
             payload=CronPayload(kind="system_event"),
         ))
-        console.print("[green]✓[/green] Knowledge sync (IMA→Obsidian→Wiki): daily at 12:25 + 17:30 Beijing time")
+        console.print("[green]✓[/green] Knowledge sync (IMA→Obsidian→Wiki): daily at 12:25 + 17:40 Beijing time")
 
     # Real-time Obsidian vault watcher: when ``sync_mode`` is ``watch`` or
     # ``poll``, spin up a background task that calls
