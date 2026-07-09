@@ -26,6 +26,10 @@ from typing import TYPE_CHECKING, Any
 from loguru import logger
 
 from nanobot.agent.tools.ima._client import IMAClient, IMAError
+from nanobot.channels.wxmp_platform import (
+    extract_article_body,
+    fetch_wxmp_article as _fetch_wxmp_article,
+)
 from nanobot.security.workspace_policy import (
     WorkspaceBoundaryError,
     require_path_within,
@@ -219,16 +223,15 @@ class IMAIngestPipeline:
 
         2. ``get_media_info`` + direct URL fetch — for URL-type media.
            Works for static web pages; for WeChat JS SPAs the response is
-           a JS bundle (not article body), and the WeChat-block-phrase
-           check filters that out → empty result.
+           a JS bundle (not article body).
 
-        In our sandboxed environment the only paths above that *can* return
-        article text are: (a) IMA owned items (notes, web pages ingested
-        by ``import_urls`` where the token is owner), or (b) static URL
-        fetches. WeChat articles added via the IMA desktop app cannot be
-        fetched by the OpenAPI token; ``web_fetch``/jina/playwright must
-        be wired through a separate channel that the agent itself does
-        not currently possess.
+        3. **wxmp_operator** — final fallback for ``mp.weixin.qq.com``
+           URLs only. Uses the operator session cookies captured by
+           ``nanobot channels login wxmp_article`` (QR scan via
+           Playwright + Edge). When authenticated, the WeChat backend
+           SSR-renders the page server-side and returns the full HTML
+           including ``<div id="js_content">``. We then extract the body
+           via :func:`extract_article_body` and return plain text.
         """
         # Path 1: get_doc_content (primary — notes, owner-authorized KB items)
         try:
@@ -239,7 +242,7 @@ class IMAIngestPipeline:
         except IMAError as exc:
             logger.debug("IMA get_doc_content failed for {}: {}", note_id, exc)
 
-        # Path 2: get_media_info + direct URL fetch
+        # Path 2: get_media_info → URL
         try:
             media_data = await self.client.get_media_info(media_id=note_id)
         except IMAError as exc:
@@ -251,6 +254,23 @@ class IMAIngestPipeline:
         if not url:
             return ""
 
+        # Path 3: WeChat operator-session fetch (only when we have
+        # credentials AND the URL is a WeChat article — saves the cost
+        # of a useless Playwright-installed-but-skipped check on other URLs).
+        is_wechat = "mp.weixin.qq.com" in url
+        if is_wechat:
+            wxmp_text = await asyncio.to_thread(_fetch_wxmp_article, url)
+            if wxmp_text:
+                title, body = extract_article_body(wxmp_text)
+                if body:
+                    logger.debug(
+                        "wxmp_article: fetched body for {} ({} chars, title={!r})",
+                        url[:60], len(body), title[:40],
+                    )
+                    # LLM summarisation strip: title + body joined.
+                    return (title + "\n\n" + body).strip()[:20_000]
+
+        # Path 2 fallback: direct URL fetch (non-WeChat, or wxmp unavailable)
         url_headers = url_info.get("headers") or {}
         return await self._fetch_url_direct(url, url_headers)
 
