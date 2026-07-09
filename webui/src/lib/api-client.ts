@@ -39,7 +39,7 @@ export const api = {
     }
     return (await res.json()) as T;
   },
-  async post<T>(path: string, body: unknown): Promise<T> {
+  async post<T>(path: string, body?: unknown): Promise<T> {
     const res = await fetch(path, {
       method: "POST",
       headers: headers(),

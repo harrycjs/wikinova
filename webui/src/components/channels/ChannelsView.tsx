@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Radio, RefreshCw, Save } from "lucide-react";
 
@@ -29,7 +29,7 @@ interface WeixinStatus {
 
 export function ChannelsView(): JSX.Element {
   const { t } = useTranslation();
-  const [tab, setTab] = useState<"overview" | "ima" | "obsidian" | "feishu" | "weixin">("overview");
+  const [tab, setTab] = useState<"overview" | "ima" | "obsidian" | "feishu" | "weixin" | "wxmp">("overview");
   const [ima, setIma] = useState<IMAStatus | null>(null);
   const [obs, setObs] = useState<ObsidianStatus | null>(null);
   const [channels, setChannels] = useState<ChannelStatus[]>([]);
@@ -160,7 +160,7 @@ export function ChannelsView(): JSX.Element {
     loadChannelConfigs();
   }, []);
 
-  const allTabs = ["overview", "ima", "obsidian", "feishu", "weixin"] as const;
+  const allTabs = ["overview", "ima", "obsidian", "feishu", "weixin", "wxmp"] as const;
 
   return (
     <div className="jobs-mode flex h-full flex-col">
@@ -213,6 +213,7 @@ export function ChannelsView(): JSX.Element {
             <ChannelCard title="Obsidian" enabled={obs?.enabled ?? false} detail={obs?.vault_path ? `${obs.file_count} files` : "Not configured"} />
             <ChannelCard title="Feishu" enabled={feishuEnabled} detail={feishuAppId ? `App: ${feishuAppId.slice(0, 8)}...` : "Not configured"} />
             <ChannelCard title="WeChat" enabled={weixinEnabled} detail={weixinConnected ? "已连接" : weixinEnabled ? "Token missing" : "Not configured"} />
+            <WxMpOverviewCard />
           </div>
         )}
 
@@ -267,6 +268,8 @@ export function ChannelsView(): JSX.Element {
             setBaseUrl={setWeixinBaseUrl}
           />
         )}
+
+        {tab === "wxmp" && <WxMpTab />}
       </div>
     </div>
   );
@@ -485,6 +488,179 @@ function ChannelCard({ title, enabled, detail }: { title: string; enabled: boole
       </div>
       <p className="mt-2 text-xs text-muted-foreground">{detail}</p>
     </article>
+  );
+}
+
+interface WxMpStatus {
+  logged_in: boolean;
+  expired: boolean;
+  login_at: number | null;
+  hours_since_login: number | null;
+  hours_until_expire: number | null;
+  ttl_hours: number;
+  token: string;
+  cookies_count: number;
+}
+
+function useWxMpStatus() {
+  const [status, setStatus] = useState<WxMpStatus | null>(null);
+  const refresh = useCallback(async () => {
+    try {
+      const data = await api.get<WxMpStatus>("/api/wxmp/status");
+      setStatus(data);
+    } catch {
+      setStatus(null);
+    }
+  }, []);
+  useEffect(() => {
+    refresh();
+    const t = setInterval(refresh, 60_000);
+    return () => clearInterval(t);
+  }, [refresh]);
+  return { status, refresh };
+}
+
+function WxMpOverviewCard() {
+  const { status } = useWxMpStatus();
+  if (!status) {
+    return <ChannelCard title="微信公众平台" enabled={false} detail="…" />;
+  }
+  if (status.logged_in && status.hours_until_expire != null) {
+    const ok = status.hours_until_expire > 12;
+    return (
+      <ChannelCard
+        title="微信公众平台"
+        enabled={ok}
+        detail={`已扫码 · ${status.cookies_count} cookies · ${status.hours_until_expire}h 后过期`}
+      />
+    );
+  }
+  if (status.expired) {
+    return <ChannelCard title="微信公众平台" enabled={false} detail="凭证已过期 · 请重新扫码" />;
+  }
+  return <ChannelCard title="微信公众平台" enabled={false} detail="未扫码登录" />;
+}
+
+function WxMpTab() {
+  const { status, refresh } = useWxMpStatus();
+  const [busy, setBusy] = useState<"login" | "logout" | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [lastResult, setLastResult] = useState<string | null>(null);
+
+  async function startLogin(): Promise<void> {
+    setBusy("login");
+    setError(null);
+    setLastResult(null);
+    try {
+      const data = await api.post<{ ok: boolean; error?: string }>("/api/wxmp/login");
+      if (!data.ok) {
+        setError(data.error || "登录失败");
+      } else {
+        setLastResult("扫码登录成功，cookies 已保存");
+      }
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setBusy(null);
+      await refresh();
+    }
+  }
+
+  async function doLogout(): Promise<void> {
+    setBusy("logout");
+    setError(null);
+    try {
+      await api.post("/api/wxmp/logout");
+      setLastResult("已清除登录状态，下次抓取微信文章会回退");
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setBusy(null);
+      await refresh();
+    }
+  }
+
+  // Status pill: green (fresh), yellow (<12h), red (expired), gray (never)
+  function StatusPill({ status }: { status: WxMpStatus | null }) {
+    if (!status) return <StatusDot enabled={false} label="加载中..." />;
+    if (status.logged_in) {
+      const remaining = status.hours_until_expire ?? 0;
+      const stale = remaining < 12;
+      return (
+        <div className="space-y-1">
+          <StatusDot
+            enabled={!stale}
+            label={stale ? "已扫码 — 凭证即将过期" : "已扫码登录"}
+          />
+          <p className="text-xs text-muted-foreground">
+            上次登录 {status.hours_since_login}h 前 ·{" "}
+            <span className={cn(stale ? "text-amber-600" : "text-emerald-600")}>
+              还有 {remaining}h 过期
+            </span>
+            {" "}({status.ttl_hours}h 总有效期)
+          </p>
+          <p className="text-xs text-muted-foreground">
+            token: <code className="rounded bg-muted/40 px-1 py-0.5">{status.token}</code>
+            {" · "}
+            cookies: {status.cookies_count}
+          </p>
+        </div>
+      );
+    }
+    if (status.expired) {
+      return <StatusDot enabled={false} label="凭证已过期，需要重新扫码" />;
+    }
+    return <StatusDot enabled={false} label="未扫码登录" />;
+  }
+
+  return (
+    <section className="max-w-xl space-y-4">
+      <h2 className="text-sm uppercase tracking-wide text-muted-foreground">
+        微信公众平台 (Operator Session)
+      </h2>
+      <p className="text-xs text-muted-foreground">
+        扫码登录后，nanobot 才能拿到 mp.weixin.qq.com 文章正文（IMA OpenAPI 拿不到公众号文章 SSR 渲染的内容，本功能用本地 Edge + Playwright 模拟扫码登录）。
+        凭证 96h 有效，到期前请重新扫码。
+      </p>
+
+      <StatusPill status={status} />
+
+      {error && (
+        <div className="rounded border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive">
+          {error}
+        </div>
+      )}
+      {lastResult && (
+        <div className="rounded border border-emerald-500/30 bg-emerald-500/5 p-3 text-sm text-emerald-600">
+          {lastResult}
+        </div>
+      )}
+
+      <div className="flex items-center gap-2">
+        <button
+          type="button"
+          onClick={startLogin}
+          disabled={busy !== null}
+          className="flex items-center gap-2 rounded bg-emerald-600 px-4 py-2 text-sm text-white hover:bg-emerald-700 disabled:opacity-50"
+        >
+          {busy === "login" ? "⏳ 等待扫码（Edge 已弹出）…" : status?.logged_in ? "🔄 重新扫码登录" : "📱 扫码登录"}
+        </button>
+        {status?.logged_in && (
+          <button
+            type="button"
+            onClick={doLogout}
+            disabled={busy !== null}
+            className="flex items-center gap-2 rounded border border-border px-3 py-2 text-sm text-muted-foreground hover:bg-muted/40 disabled:opacity-50"
+          >
+            清除凭证
+          </button>
+        )}
+      </div>
+
+      <p className="text-xs text-muted-foreground">
+        ⚠ 仅在 gateway 与显示设备同机时此按钮可用（即浏览器能在你眼前弹出来）。无显示环境下，请用 <code>nanobot channels login wxmp_platform</code> 在本机跑。
+      </p>
+    </section>
   );
 }
 

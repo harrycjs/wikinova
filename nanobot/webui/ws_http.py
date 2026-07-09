@@ -790,6 +790,12 @@ class GatewayHTTPHandler:
             return self._handle_weixin_qrcode(request)
         if got == "/api/weixin/status":
             return self._handle_weixin_status(request)
+        if got == "/api/wxmp/status":
+            return self._handle_wxmp_status(request)
+        if got == "/api/wxmp/login":
+            return await self._handle_wxmp_login(request)
+        if got == "/api/wxmp/logout":
+            return self._handle_wxmp_logout(request)
         m = re.match(r"^/api/webui/skills/([^/]+)$", got)
         if m:
             return self._handle_webui_skill_detail(request, m.group(1))
@@ -1616,6 +1622,81 @@ class GatewayHTTPHandler:
         has_token = bool(wx.get("token"))
         enabled = wx.get("enabled", False)
         return {"connected": enabled and has_token, "has_token": has_token, "enabled": enabled}
+
+    # ----- WeChat Official Account Platform (微信公众平台) operator session -----
+
+    def _handle_wxmp_status(self, request: WsRequest) -> Response:
+        """Return current wxmp_article login state + credential age.
+
+        Used by the Channels page to render a 96h-expiry warning.
+        """
+        from nanobot.channels.wxmp_platform import _LOGIN_TTL_S, load_credentials
+
+        if not self.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        cred = load_credentials()
+        now = time.time()
+        if cred is None:
+            # Distinguish "file missing" vs "credentials expired"
+            state_file = Path.home() / ".nanobot" / "wxmp_article" / "wxmp_article_login.json"
+            return _http_json_response({
+                "logged_in": False,
+                "expired": state_file.exists(),  # file exists but expired
+                "login_at": None,
+                "hours_since_login": None,
+                "hours_until_expire": None,
+                "ttl_hours": round(_LOGIN_TTL_S / 3600, 1),
+                "token": "",
+                "cookies_count": 0,
+            })
+        elapsed = now - cred.login_at
+        remaining = max(0.0, _LOGIN_TTL_S - elapsed)
+        expired = remaining <= 0
+        return _http_json_response({
+            "logged_in": not expired,
+            "expired": expired,
+            "login_at": int(cred.login_at),
+            "hours_since_login": round(elapsed / 3600, 1),
+            "hours_until_expire": round(remaining / 3600, 1),
+            "ttl_hours": round(_LOGIN_TTL_S / 3600, 1),
+            "token": cred.token,
+            "cookies_count": len(cred.cookies),
+        })
+
+    async def _handle_wxmp_login(self, request: WsRequest) -> Response:
+        """Launch the Playwright+Edge QR-scan login flow.
+
+        Blocks until the user scans (typically 5-30s) or the 10-minute
+        Playwright timeout fires. Uses ``asyncio.to_thread`` to run the
+        synchronous Playwright sync API without blocking the gateway
+        event loop. NOTE: this only works when the gateway runs on a
+        machine with a display (where Edge can pop up); on a
+        headless server, fall back to ``nanobot channels login
+        wxmp_platform`` from an interactive shell.
+        """
+        if not self.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+
+        def _run_login() -> dict:
+            from nanobot.channels.wxmp_platform import WxMpPlatformChannel
+            channel = WxMpPlatformChannel({"workspace": str(Path.home() / ".nanobot")}, bus=None)
+            ok = channel._login_sync(force=True)
+            return {"ok": ok}
+
+        try:
+            result = await asyncio.to_thread(_run_login)
+            return _http_json_response(result)
+        except Exception as exc:
+            return _http_json_response({"ok": False, "error": str(exc)})
+
+    def _handle_wxmp_logout(self, request: WsRequest) -> Response:
+        """Clear stored wxmp credentials (forces re-scan on next fetch)."""
+        from nanobot.channels.wxmp_platform import clear_credentials
+
+        if not self.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        deleted = clear_credentials()
+        return _http_json_response({"ok": True, "deleted": deleted})
 
     def _handle_channels_list(self, request: WsRequest) -> Response:
         """List available channels with their enabled status."""
