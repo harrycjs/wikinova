@@ -1957,17 +1957,17 @@ def _run_gateway(
             f"[green]✓[/green] Wiki evolution: every {wiki_cfg.evolution.interval_h}h"
         )
 
-    # Knowledge sync: IMA → Obsidian → Wiki daily at 19:30 Beijing time
+    # Knowledge sync: IMA → Obsidian → Wiki daily at 10:55 Beijing time
     ima_cfg = getattr(config.tools, "ima", None)
     obs_cfg = getattr(config.tools, "obsidian", None)
     if getattr(ima_cfg, "enabled", False) or getattr(obs_cfg, "enabled", False):
         cron.register_system_job(CronJob(
             id="knowledge_sync",
             name="knowledge_sync",
-            schedule=CronSchedule(kind="cron", expr="30 21 * * *", tz="Asia/Shanghai"),
+            schedule=CronSchedule(kind="cron", expr="55 10 * * *", tz="Asia/Shanghai"),
             payload=CronPayload(kind="system_event"),
         ))
-        console.print("[green]✓[/green] Knowledge sync (IMA→Obsidian→Wiki): daily at 21:30 Beijing time")
+        console.print("[green]✓[/green] Knowledge sync (IMA→Obsidian→Wiki): daily at 10:55 Beijing time")
 
     # Real-time Obsidian vault watcher: when ``sync_mode`` is ``watch`` or
     # ``poll``, spin up a background task that calls

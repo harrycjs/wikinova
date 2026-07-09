@@ -55,6 +55,6 @@ class ToolContext:
     file_state_store: Any = field(default=None)
     provider_snapshot_loader: Callable[[], Any] | None = None
     image_generation_provider_configs: dict[str, Any] | None = None
-    timezone: str = "UTC"
+    timezone: str = "Asia/Shanghai"
     workspace_sandbox: Any | None = None
     runtime_events: Any | None = None

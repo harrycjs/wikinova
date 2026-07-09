@@ -45,6 +45,28 @@ _SUMMARY_RE = re.compile(
 )
 
 
+# Phrases that appear on the mp.weixin.qq.com anti-bot / verification page.
+# When we see any of these in extracted text, treat the fetch as empty so the
+# note is skipped instead of producing a "blocked" placeholder summary.
+_WECHAT_BLOCK_PHRASES = (
+    "环境异常",
+    "环境校验",
+    "访问频次过高",
+    "请完成验证",
+    "请在微信中打开",
+    "非微信内网页",
+    "无法确认此次请求的合法性",
+)
+
+
+def _looks_like_wechat_block_page(text: str) -> bool:
+    """Return True if *text* looks like the WeChat anti-bot / verification page."""
+    if not text:
+        return False
+    head = text[:1500]
+    return any(phrase in head for phrase in _WECHAT_BLOCK_PHRASES)
+
+
 @dataclass
 class PipelineResult:
     """Outcome of one pipeline run."""
@@ -207,10 +229,40 @@ class IMAIngestPipeline:
             if url:
                 import httpx
 
-                resp = httpx.get(url, timeout=20, follow_redirects=True)
+                # Browser-like headers: mp.weixin.qq.com returns its "环境异常"
+                # anti-bot page when the client UA looks like a bot (Python httpx
+                # default UA, no Referer, no Accept). Reusing the same UA the
+                # web_fetch tool uses bypasses the check for most articles.
+                fetch_headers = {
+                    "User-Agent": (
+                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/126.0.0.0 Safari/537.36"
+                    ),
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                }
+                if "mp.weixin.qq.com" in url:
+                    fetch_headers["Referer"] = "https://mp.weixin.qq.com/"
+                resp = httpx.get(
+                    url,
+                    timeout=20,
+                    follow_redirects=True,
+                    headers=fetch_headers,
+                )
                 if resp.status_code == 200 and len(resp.text) > 50:
                     text = re.sub(r"<[^>]+>", " ", resp.text)
-                    return re.sub(r"\s+", " ", text).strip()[:10_000]
+                    text = re.sub(r"\s+", " ", text).strip()[:10_000]
+                    # Detect WeChat anti-bot/verification placeholder pages so
+                    # we don't write fake "blocked" summaries into the inbox.
+                    if "mp.weixin.qq.com" in url and _looks_like_wechat_block_page(text):
+                        logger.debug(
+                            "IMA fetch returned WeChat anti-bot page for {}; "
+                            "treating as empty content so the note is skipped.",
+                            note_id,
+                        )
+                        return ""
+                    return text
         except Exception as exc:  # noqa: BLE001
             logger.debug("IMA get_media_info / URL fetch failed for {}: {}", note_id, exc)
 
@@ -230,11 +282,14 @@ class IMAIngestPipeline:
         )
         from nanobot.providers.base import GenerationSettings
 
+        settings = GenerationSettings(max_tokens=10000, temperature=0.2)
         try:
             response = await self.provider.chat(
                 messages=[{"role": "user", "content": prompt}],
                 model=self.model,
-                settings=GenerationSettings(max_tokens=10000, temperature=0.2),
+                max_tokens=settings.max_tokens,
+                temperature=settings.temperature,
+                reasoning_effort=settings.reasoning_effort,
                 tools=None,
             )
         except Exception as exc:  # noqa: BLE001

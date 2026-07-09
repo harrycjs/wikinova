@@ -1786,7 +1786,7 @@ async def test_settings_api_returns_safe_subset_and_updates_whitelist(
         assert body["agent"]["provider"] == "openai"
         assert body["agent"]["model_preset"] == "default"
         assert body["agent"]["max_tokens"] == 8192
-        assert body["agent"]["timezone"] == "UTC"
+        assert body["agent"]["timezone"] == "Asia/Shanghai"
         assert body["agent"]["tool_hint_max_length"] == 40
         presets = {preset["name"]: preset for preset in body["model_presets"]}
         assert presets["default"]["active"] is True

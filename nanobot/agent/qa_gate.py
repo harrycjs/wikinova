@@ -196,7 +196,9 @@ async def llm_classify(provider: "LLMProvider", text: str, model: str) -> QAGate
         response = await provider.chat(
             messages=[{"role": "system", "content": system}, {"role": "user", "content": prompt}],
             model=model,
-            settings=settings,
+            max_tokens=settings.max_tokens,
+            temperature=settings.temperature,
+            reasoning_effort=settings.reasoning_effort,
             tools=None,
         )
         token = (response.content or "").strip().upper()

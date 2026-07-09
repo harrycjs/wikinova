@@ -242,7 +242,8 @@ class _StubProvider:
 
     generation = _Generation()
 
-    async def chat(self, *, messages, model, settings, tools=None):
+    async def chat(self, *, messages, model, max_tokens=4096, temperature=0.7,
+                   reasoning_effort=None, tools=None):
         self.calls.append({"messages": messages, "model": model})
         from nanobot.providers.base import LLMResponse
 
@@ -474,7 +475,8 @@ async def test_run_once_cursor_advances_only_for_successful_writes(tmp_path: Pat
 
     summarize_calls: list[str] = []
 
-    async def chat(self, *, messages, model, settings, tools=None):
+    async def chat(self, *, messages, model, max_tokens=4096, temperature=0.7,
+                   reasoning_effort=None, tools=None):
         prompt_text = messages[0]["content"] if messages else ""
         m = _re.search(r"来源 ID：([a-z])", prompt_text)
         if m:
@@ -482,10 +484,16 @@ async def test_run_once_cursor_advances_only_for_successful_writes(tmp_path: Pat
             summarize_calls.append(nid)
             sub = _StubProvider(response_per_id[nid])  # type: ignore[arg-type]
             return await sub.chat(
-                messages=messages, model=model, settings=settings, tools=tools
+                messages=messages, model=model, tools=tools,
+                max_tokens=max_tokens, temperature=temperature,
+                reasoning_effort=reasoning_effort,
             )
         sub = _StubProvider("")  # type: ignore[arg-type]
-        return await sub.chat(messages=messages, model=model, settings=settings, tools=tools)
+        return await sub.chat(
+            messages=messages, model=model, tools=tools,
+            max_tokens=max_tokens, temperature=temperature,
+            reasoning_effort=reasoning_effort,
+        )
 
     import types
 
