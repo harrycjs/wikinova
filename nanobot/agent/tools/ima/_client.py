@@ -169,6 +169,31 @@ class IMAClient:
     async def get_media_info(self, media_id: str) -> dict[str, Any]:
         return await self._request("openapi/wiki/v1/get_media_info", {"media_id": media_id})
 
+    async def import_urls(
+        self,
+        urls: list[str],
+        *,
+        knowledge_base_id: str,
+        folder_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Add web pages or WeChat articles to a KB.
+
+        Per the official IMA skill: this is the replacement for
+        ``add_knowledge`` with ``media_type=2/6``. IMA extracts page content
+        server-side (including JS-rendered WeChat articles) and returns a
+        ``results`` mapping of ``{url: {url, ret_code, media_id}}``.
+
+        Per api.md: omit ``folder_id`` for the KB root. For some endpoints
+        that strictly require folder_id, you may pass ``knowledge_base_id``
+        as the root folder id.
+        """
+        if not 1 <= len(urls) <= 10:
+            raise ValueError(f"import_urls accepts 1-10 URLs, got {len(urls)}")
+        body: dict[str, Any] = {"knowledge_base_id": knowledge_base_id, "urls": urls}
+        if folder_id:
+            body["folder_id"] = folder_id
+        return await self._request("openapi/wiki/v1/import_urls", body)
+
     # -- notes helpers --------------------------------------------------
 
     async def list_notebook(self, *, cursor: str = "0", limit: int = 20) -> dict[str, Any]:

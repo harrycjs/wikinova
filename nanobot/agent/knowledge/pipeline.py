@@ -209,10 +209,28 @@ class IMAIngestPipeline:
     async def _fetch_note_content(self, note_id: str) -> str:
         """Fetch content for a note or KB media item.
 
-        Tries ``get_doc_content`` first (works for notes and some KB items).
-        Falls back to ``get_media_info`` → URL fetch for KB media items.
+        Strategy:
+
+        1. ``get_doc_content`` — primary. Returns IMA's server-extracted text
+           when the calling token owns the source. For WeChat KB items added
+           via the user's desktop client, the OpenAPI token is *not* the
+           owner, so this returns ``210005 GetNoteContent not author`` and
+           we fall through.
+
+        2. ``get_media_info`` + direct URL fetch — for URL-type media.
+           Works for static web pages; for WeChat JS SPAs the response is
+           a JS bundle (not article body), and the WeChat-block-phrase
+           check filters that out → empty result.
+
+        In our sandboxed environment the only paths above that *can* return
+        article text are: (a) IMA owned items (notes, web pages ingested
+        by ``import_urls`` where the token is owner), or (b) static URL
+        fetches. WeChat articles added via the IMA desktop app cannot be
+        fetched by the OpenAPI token; ``web_fetch``/jina/playwright must
+        be wired through a separate channel that the agent itself does
+        not currently possess.
         """
-        # Attempt 1: get_doc_content (works for notes and note-type KB items)
+        # Path 1: get_doc_content (primary — notes, owner-authorized KB items)
         try:
             data = await self.client.get_doc_content(note_id=note_id, content_format=0)
             for key in ("content", "doc_content", "text"):
@@ -221,51 +239,55 @@ class IMAIngestPipeline:
         except IMAError as exc:
             logger.debug("IMA get_doc_content failed for {}: {}", note_id, exc)
 
-        # Attempt 2: get_media_info → fetch URL (for KB media items)
+        # Path 2: get_media_info + direct URL fetch
         try:
             media_data = await self.client.get_media_info(media_id=note_id)
-            url_info = (media_data.get("data") or media_data).get("url_info") or {}
-            url = url_info.get("url") or ""
-            if url:
-                import httpx
+        except IMAError as exc:
+            logger.debug("IMA get_media_info failed for {}: {}", note_id, exc)
+            return ""
 
-                # Browser-like headers: mp.weixin.qq.com returns its "环境异常"
-                # anti-bot page when the client UA looks like a bot (Python httpx
-                # default UA, no Referer, no Accept). Reusing the same UA the
-                # web_fetch tool uses bypasses the check for most articles.
-                fetch_headers = {
-                    "User-Agent": (
-                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/126.0.0.0 Safari/537.36"
-                    ),
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-                }
-                if "mp.weixin.qq.com" in url:
-                    fetch_headers["Referer"] = "https://mp.weixin.qq.com/"
-                resp = httpx.get(
-                    url,
-                    timeout=20,
-                    follow_redirects=True,
-                    headers=fetch_headers,
-                )
-                if resp.status_code == 200 and len(resp.text) > 50:
-                    text = re.sub(r"<[^>]+>", " ", resp.text)
-                    text = re.sub(r"\s+", " ", text).strip()[:10_000]
-                    # Detect WeChat anti-bot/verification placeholder pages so
-                    # we don't write fake "blocked" summaries into the inbox.
-                    if "mp.weixin.qq.com" in url and _looks_like_wechat_block_page(text):
-                        logger.debug(
-                            "IMA fetch returned WeChat anti-bot page for {}; "
-                            "treating as empty content so the note is skipped.",
-                            note_id,
-                        )
-                        return ""
-                    return text
+        url_info = (media_data.get("data") or media_data).get("url_info") or {}
+        url = url_info.get("url") or ""
+        if not url:
+            return ""
+
+        url_headers = url_info.get("headers") or {}
+        return await self._fetch_url_direct(url, url_headers)
+
+    async def _fetch_url_direct(self, url: str, extra_headers: dict[str, str]) -> str:
+        """Direct httpx fetch with browser-shaped headers."""
+        import httpx as _httpx
+
+        fetch_headers: dict[str, str] = {
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/126.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        }
+        if "mp.weixin.qq.com" in url:
+            fetch_headers["Referer"] = "https://mp.weixin.qq.com/"
+        fetch_headers.update(extra_headers)
+
+        try:
+            resp = _httpx.get(
+                url,
+                timeout=20,
+                follow_redirects=True,
+                headers=fetch_headers,
+            )
+            if resp.status_code == 200 and len(resp.text) > 50:
+                text = re.sub(r"<[^>]+>", " ", resp.text)
+                text = re.sub(r"\s+", " ", text).strip()[:10_000]
+                # Drop WeChat's anti-bot/verification placeholder pages so
+                # callers don't see them as article content.
+                if "mp.weixin.qq.com" in url and _looks_like_wechat_block_page(text):
+                    return ""
+                return text
         except Exception as exc:  # noqa: BLE001
-            logger.debug("IMA get_media_info / URL fetch failed for {}: {}", note_id, exc)
-
+            logger.debug("direct URL fetch failed for {}: {}", url[:80], exc)
         return ""
 
     # -- LLM summarization ----------------------------------------------
